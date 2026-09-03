@@ -1,0 +1,28 @@
+# 【W6】一键部署：MySQL + 后端
+# 用法：docker-compose up -d
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: rag_kb
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  backend:
+    build: .
+    depends_on:
+      - mysql
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: mysql+pymysql://root:password@mysql:3306/rag_kb?charset=utf8mb4
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/code/data
+
+volumes:
+  mysql_data:

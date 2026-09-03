@@ -1,0 +1,18 @@
+# ⚠️ 最重要：API Key 泄露会被扫号盗用，.env 绝不提交
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 数据（上传的文档、向量库、sqlite 都不进仓库）
+data/
+
+# 前端构建产物以外的依赖
+node_modules/
+
+# IDE
+.idea/
+.vscode/

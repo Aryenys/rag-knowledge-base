@@ -1,0 +1,25 @@
+# Web 框架
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart          # FastAPI 文件上传必需
+
+# 配置与 HTTP
+python-dotenv
+httpx                     # 调 embedding/rerank API
+
+# LLM SDK（DeepSeek 兼容 OpenAI 协议）
+openai>=1.30
+
+# 文本处理
+langchain-text-splitters  # 递归字符切分
+pypdf                     # PDF 解析
+python-docx               # DOCX 解析
+jieba                     # 中文分词（BM25 用，W3）
+
+# 检索
+chromadb                  # 向量库
+rank-bm25                 # BM25（W3）
+
+# 数据库（W4）
+sqlalchemy>=2.0
+pymysql                   # MySQL 驱动
