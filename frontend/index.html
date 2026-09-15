@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAG 知识库助手</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f5f6f8; height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    background: #fff; border-bottom: 1px solid #e8e8e8;
+    padding: 14px 24px; font-size: 16px; font-weight: 500;
+    display: flex; align-items: center; flex-shrink: 0;
+  }
+  header span { color: #888; font-size: 13px; font-weight: 400; margin-left: 8px; }
+  #docs-btn {
+    margin-left: auto; background: #fff; border: 1px solid #ddd;
+    border-radius: 8px; padding: 6px 14px; font-size: 13px; cursor: pointer;
+  }
+  #docs-btn:hover { border-color: #4f7cff; color: #4f7cff; }
+
+  /* ---------- 主体：左侧会话栏 + 右侧内容区 ---------- */
+  #main { flex: 1; display: flex; overflow: hidden; }
+
+  #sidebar {
+    width: 220px; flex-shrink: 0; background: #fff;
+    border-right: 1px solid #e8e8e8; display: flex; flex-direction: column;
+  }
+  #new-chat-btn {
+    margin: 12px; padding: 9px; background: #4f7cff; color: #fff; border: none;
+    border-radius: 8px; font-size: 13px; cursor: pointer;
+  }
+  #new-chat-btn:hover { background: #3d68e8; }
+  #session-list { flex: 1; overflow-y: auto; padding: 0 8px 12px; }
+  .session-item {
+    display: flex; align-items: center; gap: 6px; padding: 9px 10px;
+    border-radius: 8px; font-size: 13px; cursor: pointer; color: #333;
+  }
+  .session-item:hover { background: #f2f4f8; }
+  /* 当前会话高亮 */
+  .session-item.active { background: #e8efff; color: #2a5ae8; }
+  /* 标题用省略号，避免长问题把侧边栏撑破 */
+  .session-title {
+    flex: 1; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; min-width: 0;
+  }
+  .session-del {
+    background: none; border: none; color: #bbb; cursor: pointer;
+    font-size: 15px; line-height: 1; padding: 0 2px; flex-shrink: 0;
+  }
+  .session-del:hover { color: #d9534f; }
+  #sidebar-empty { padding: 12px; font-size: 12px; color: #aaa; }
+
+  #content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #docs-panel {
+    display: none; background: #fff; border-bottom: 1px solid #e8e8e8;
+    padding: 16px 24px; flex-shrink: 0;
+  }
+  #docs-panel.open { display: block; }
+  #docs-inner { max-width: 860px; margin: 0 auto; }
+  #upload-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  #upload-status { font-size: 12px; color: #888; }
+  .doc-item {
+    display: flex; align-items: center; gap: 10px; font-size: 13px;
+    padding: 8px 12px; border: 1px solid #eee; border-radius: 8px; margin-top: 6px;
+  }
+  .doc-item .name { font-weight: 500; }
+  .doc-item .meta { color: #999; font-size: 12px; }
+  .doc-del {
+    margin-left: auto; background: none; border: none; color: #d9534f;
+    cursor: pointer; font-size: 13px;
+  }
+  #chat {
+    flex: 1; overflow-y: auto; padding: 24px;
+    display: flex; flex-direction: column; gap: 16px;
+    max-width: 860px; width: 100%; margin: 0 auto;
+  }
+  .msg { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.7;
+         font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user {
+    align-self: flex-end; background: #4f7cff; color: #fff;
+    border-bottom-right-radius: 4px;
+  }
+  .msg.bot {
+    align-self: flex-start; background: #fff; color: #222;
+    border: 1px solid #e8e8e8; border-bottom-left-radius: 4px;
+  }
+  .sources { margin-top: 10px; border-top: 1px dashed #ddd; padding-top: 8px; }
+  .sources-title { font-size: 12px; color: #999; margin-bottom: 6px; }
+  .source-item {
+    font-size: 12px; color: #666; background: #f7f8fa;
+    border-radius: 6px; padding: 6px 10px; margin-top: 4px;
+  }
+  .source-item b { color: #4f7cff; }
+  .typing::after { content: "▍"; animation: blink 0.8s infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #input-bar {
+    background: #fff; border-top: 1px solid #e8e8e8; padding: 14px 24px;
+    flex-shrink: 0;
+  }
+  #input-inner { max-width: 860px; margin: 0 auto; display: flex; gap: 10px; }
+  #question {
+    flex: 1; border: 1px solid #ddd; border-radius: 10px;
+    padding: 12px 14px; font-size: 14px; outline: none; resize: none;
+    font-family: inherit;
+  }
+  #question:focus { border-color: #4f7cff; }
+  #send-btn {
+    background: #4f7cff; color: #fff; border: none; border-radius: 10px;
+    padding: 0 22px; font-size: 14px; cursor: pointer;
+  }
+  #send-btn:disabled { background: #b9c8f5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+
+<header>RAG 知识库助手<span>基于你上传的文档回答，附引用来源</span>
+  <button id="docs-btn">文档管理</button>
+</header>
+
+<div id="main">
+  <!-- ---------- 左侧：会话列表 ---------- -->
+  <aside id="sidebar">
+    <button id="new-chat-btn">+ 新对话</button>
+    <div id="session-list"></div>
+  </aside>
+
+  <!-- ---------- 右侧：文档面板 + 对话区 + 输入栏 ---------- -->
+  <div id="content">
+    <div id="docs-panel">
+      <div id="docs-inner">
+        <div id="upload-row">
+          <input type="file" id="file-input" accept=".pdf,.md,.txt,.docx">
+          <span id="upload-status"></span>
+        </div>
+        <div id="doc-list"></div>
+      </div>
+    </div>
+    <div id="chat"></div>
+    <div id="input-bar">
+      <div id="input-inner">
+        <textarea id="question" rows="1" placeholder="输入问题，回车发送（Shift+回车换行）"></textarea>
+        <button id="send-btn">发送</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const chatEl = document.getElementById("chat");
+const questionEl = document.getElementById("question");
+const sendBtn = document.getElementById("send-btn");
+const sessionListEl = document.getElementById("session-list");
+
+// 当前会话 id。null = 还没开始对话，后端收到 null 会自动新建一个会话
+// 并在响应的第一帧把新建的 id 推回来
+let currentSessionId = null;
+
+function addMsg(role, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.textContent = text;
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+
+// ---------- 会话管理 ----------
+
+async function loadSessions() {
+  const resp = await fetch("/api/chat/sessions");
+  const sessions = await resp.json();
+  sessionListEl.innerHTML = "";
+
+  if (sessions.length === 0) {
+    sessionListEl.innerHTML = '<div id="sidebar-empty">还没有会话，发条消息开始吧</div>';
+    return;
+  }
+
+  for (const s of sessions) {
+    const item = document.createElement("div");
+    item.className = "session-item" + (s.id === currentSessionId ? " active" : "");
+
+    // ⚠️ 用 textContent 而不是 innerHTML 设置标题：
+    // 标题来源是用户自己输入的问题，如果问题里带 <script> 标签，
+    // innerHTML 会当成 HTML 执行（XSS 攻击）；textContent 只当纯文本
+    const title = document.createElement("span");
+    title.className = "session-title";
+    title.textContent = s.title;
+    item.appendChild(title);
+
+    const del = document.createElement("button");
+    del.className = "session-del";
+    del.textContent = "×";
+    del.title = "删除会话";
+    del.onclick = (e) => { e.stopPropagation(); deleteSession(s.id, s.title); };
+    item.appendChild(del);
+
+    item.onclick = () => openSession(s.id);
+    sessionListEl.appendChild(item);
+  }
+}
+
+function newChat() {
+  currentSessionId = null;
+  chatEl.innerHTML = "";
+  loadSessions();
+  questionEl.focus();
+}
+
+async function openSession(id) {
+  currentSessionId = id;
+  const resp = await fetch("/api/chat/sessions/" + id + "/messages");
+  const messages = await resp.json();
+
+  chatEl.innerHTML = "";
+  for (const m of messages) {
+    const el = addMsg(m.role === "user" ? "user" : "bot", m.content);
+    // 历史消息里也带引用来源，一并还原出来
+    if (m.sources) renderSources(el, m.sources);
+  }
+  chatEl.scrollTop = chatEl.scrollHeight;
+  loadSessions();   // 刷新高亮
+}
+
+async function deleteSession(id, title) {
+  if (!confirm('确定删除会话 "' + title + '" 吗？')) return;
+  await fetch("/api/chat/sessions/" + id, { method: "DELETE" });
+  if (id === currentSessionId) {
+    currentSessionId = null;
+    chatEl.innerHTML = "";
+  }
+  loadSessions();
+}
+
+// ---------- 提问与流式接收 ----------
+
+async function send() {
+  const question = questionEl.value.trim();
+  if (!question) return;
+  questionEl.value = "";
+  sendBtn.disabled = true;
+
+  addMsg("user", question);
+  const botEl = addMsg("bot", "");
+  botEl.classList.add("typing");   // 打字光标
+
+  try {
+    // ⚠️ 核心：为什么用 fetch 而不是 EventSource？
+    // EventSource 只支持 GET，我们的接口是 POST（问题在请求体里）。
+    // fetch + ReadableStream 可以逐块读取响应体，手动解析 SSE 帧。
+    const resp = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // 带上会话 id，后端才知道要把这条消息归到哪次对话里
+      body: JSON.stringify({ question: question, session_id: currentSessionId }),
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";       // 残帧缓冲：一个 SSE 帧可能被拆到两个网络包里
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE 帧以两个换行分隔，逐个取出完整的帧
+      let sepIndex;
+      while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + 2);
+        if (!frame.startsWith("data: ")) continue;
+
+        const data = JSON.parse(frame.slice(6));
+        if (data.type === "session") {
+          // 后端新建的会话 id，存起来，后续提问都带上它 —— 多轮对话的关键
+          currentSessionId = data.id;
+        } else if (data.type === "token") {
+          botEl.textContent += data.content;          // 逐 token 追加 = 打字机
+          chatEl.scrollTop = chatEl.scrollHeight;
+        } else if (data.type === "sources") {
+          renderSources(botEl, data.content);
+        } else if (data.type === "done") {
+          // 刷新会话列表：此刻后端已把标题更新成问题的前 20 字
+          loadSessions();
+        }
+      }
+    }
+  } catch (err) {
+    botEl.textContent = "出错了: " + err.message;
+  } finally {
+    botEl.classList.remove("typing");
+    sendBtn.disabled = false;
+    questionEl.focus();
+  }
+}
+
+function renderSources(botEl, sources) {
+  if (!sources || sources.length === 0) return;
+  const box = document.createElement("div");
+  box.className = "sources";
+  box.innerHTML = '<div class="sources-title">引用来源</div>';
+  for (const s of sources) {
+    const item = document.createElement("div");
+    item.className = "source-item";
+    const pageText = s.page ? " 第" + s.page + "页" : "";
+    item.innerHTML = "<b>[" + s.index + "]</b> " + s.filename + pageText +
+                     "（相关分 " + s.score + "）<br>" + s.content.slice(0, 80) + "...";
+    box.appendChild(item);
+  }
+  botEl.appendChild(box);
+}
+
+// ---------- 文档管理 ----------
+const docsBtn = document.getElementById("docs-btn");
+const docsPanel = document.getElementById("docs-panel");
+const fileInput = document.getElementById("file-input");
+const uploadStatus = document.getElementById("upload-status");
+const docList = document.getElementById("doc-list");
+
+docsBtn.addEventListener("click", () => {
+  docsPanel.classList.toggle("open");
+  if (docsPanel.classList.contains("open")) loadDocs();
+});
+
+async function loadDocs() {
+  const resp = await fetch("/api/documents");
+  const docs = await resp.json();
+  docList.innerHTML = docs.length === 0
+    ? '<div style="font-size:13px;color:#999;margin-top:8px;">还没有文档，先上传一个吧</div>' : "";
+  for (const d of docs) {
+    const item = document.createElement("div");
+    item.className = "doc-item";
+    // created_at 是 UTC 的 ISO 字符串（结尾带 Z），必须交给 Date 按浏览器本地时区换算。
+    // 以前直接 .slice(0,16) 截取字符串，等于把 UTC 挂钟时间当成北京时间显示，整整差 8 小时。
+    const time = new Date(d.created_at).toLocaleString("zh-CN", { hour12: false });
+    item.innerHTML = '<span class="name">' + d.filename + '</span>' +
+                     '<span class="meta">' + d.chunk_count + ' 块 · ' + time + '</span>';
+    const del = document.createElement("button");
+    del.className = "doc-del";
+    del.textContent = "删除";
+    del.onclick = () => deleteDoc(d.id, d.filename);
+    item.appendChild(del);
+    docList.appendChild(item);
+  }
+}
+
+// 文件选择后自动上传（FormData 是浏览器上传文件的标准格式 multipart/form-data）
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);          // 字段名 "file" 要和后端 UploadFile 参数名一致
+  uploadStatus.textContent = "上传并入库中（解析+切分+向量化，请稍候）...";
+  try {
+    const resp = await fetch("/api/documents/upload", { method: "POST", body: form });
+    if (!resp.ok) {
+      // 500 时后端返回的是纯文本而非 JSON，先按文本读再尝试提取 detail
+      const text = await resp.text();
+      let msg = text;
+      try { msg = JSON.parse(text).detail || text; } catch (e) {}
+      throw new Error(msg.slice(0, 200));
+    }
+    const data = await resp.json();
+    uploadStatus.textContent = "✓ " + data.filename + " 入库完成（" + data.chunk_count + " 块）";
+    loadDocs();
+  } catch (err) {
+    uploadStatus.textContent = "✗ " + err.message;
+  } finally {
+    fileInput.value = "";
+  }
+});
+
+async function deleteDoc(id, filename) {
+  if (!confirm('确定删除 "' + filename + '" 吗？（向量、记录、文件都会删除）')) return;
+  await fetch("/api/documents/" + id, { method: "DELETE" });
+  loadDocs();
+}
+
+// ---------- 事件绑定与启动 ----------
+document.getElementById("new-chat-btn").addEventListener("click", newChat);
+sendBtn.addEventListener("click", send);
+questionEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+
+loadSessions();   // 启动时先拉取已有会话列表
+questionEl.focus();
+</script>
+
+</body>
+</html>
