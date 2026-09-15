@@ -1,28 +1,53 @@
 # 【W6】一键部署：MySQL + 后端
-# 用法：docker-compose up -d
+# 用法：
+#   docker compose up -d          # 后台启动
+#   docker compose logs -f backend  # 看后端日志
+#   docker compose down            # 停止（数据卷保留）
+#
+# ⚠️ 用之前先确认本机 8000 端口没被占用（本地跑的 uvicorn 会占用）
 services:
   mysql:
-    image: mysql:8.0
+    image: mysql:8.4          # 8.0 已 EOL，用 8.4 LTS
     environment:
-      MYSQL_ROOT_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-password}
       MYSQL_DATABASE: rag_kb
+      TZ: Asia/Shanghai
+    # 宿主机 3306 通常已被你本机的 MySQL 占用，所以映射到 3307 避免冲突。
+    # 容器内的 backend 是通过服务名 mysql:3306 访问的，不受这个映射影响。
     ports:
-      - "3306:3306"
+      - "3307:3306"
     volumes:
-      - mysql_data:/var/lib/mysql
+      - mysql_data:/var/lib/mysql   # 数据卷：容器删了数据还在
+    # healthcheck 是下面 depends_on 能"等真正就绪"的前提。
+    # 没有它，depends_on 只知道容器进程起来了，但 MySQL 可能还在初始化，
+    # 此时 backend 连上来会直接失败。
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1",
+             "-uroot", "-p${MYSQL_ROOT_PASSWORD:-password}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 40s        # MySQL 首次初始化较慢，给它 40 秒宽限期
+    restart: unless-stopped
 
   backend:
     build: .
     depends_on:
-      - mysql
+      mysql:
+        condition: service_healthy   # 关键：等 MySQL 健康了才启动，而不是只等它"启动"
     env_file:
-      - .env
+      - .env                         # API Key 等敏感配置从这里读，不写死在文件里
     environment:
-      DATABASE_URL: mysql+pymysql://root:password@mysql:3306/rag_kb?charset=utf8mb4
+      # 注意主机名是服务名 mysql，不是 localhost ——
+      # 在容器网络里 localhost 指的是容器自己，写 localhost 会连不上数据库
+      DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-password}@mysql:3306/rag_kb?charset=utf8mb4
+      TZ: Asia/Shanghai
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/code/data
+      - ./data:/code/data     # 上传的文档 + 向量库持久化
+      - ./logs:/code/logs     # 日志持久化，否则容器一删日志就全没了
+    restart: unless-stopped
 
 volumes:
   mysql_data:

@@ -1,0 +1,23 @@
+# 虚拟环境：宿主机的 .venv 是 Windows 版，进容器会导致 pip 包不可用
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 密钥：绝不进镜像（镜像会被推到仓库，等于泄露）
+.env
+
+# 运行时数据：通过 volume 挂载，打包进镜像只会让镜像变大且失效
+data/
+logs/
+
+# 版本控制与 IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# 开发期脚本与评测集，生产镜像不需要
+tests/
+scripts/
+*.md
