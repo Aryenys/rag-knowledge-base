@@ -14,9 +14,22 @@ _client = OpenAI(api_key=settings.DEEPSEEK_API_KEY, base_url=settings.DEEPSEEK_B
 
 
 def rewrite_query(question: str, history: list[dict]) -> str:
-    """【W3】查询改写：结合历史把"它怎么样"补全成独立问题（非流式，一次拿结果）"""
-    # TODO(W3): 用 QUERY_REWRITE_PROMPT 调一次非流式生成，temperature=0
-    raise NotImplementedError
+    """【W3·Step12】查询改写：结合历史把"它怎么样"补全成独立完整的问题。
+    用于检索前的 query 标准化（指代消解）。非流式，一次拿结果；temperature=0 求稳定。
+    无历史时直接返回原问题（省一次 LLM 调用）。"""
+    if not history:
+        return question
+
+    prompt = prompts.QUERY_REWRITE_PROMPT.format(
+        history=prompts.format_history(history),
+        question=question,
+    )
+    resp = _client.chat.completions.create(
+        model=settings.LLM_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,  # 改写是确定性任务，不需要任何"发挥"
+    )
+    return resp.choices[0].message.content.strip()
 
 
 def stream_generate(question: str, chunks: list[dict], history: list[dict]):
@@ -24,11 +37,14 @@ def stream_generate(question: str, chunks: list[dict], history: list[dict]):
     流式生成回答（生成器，逐 token yield 字符串）。
     消息结构：system(带参考资料的 RAG prompt) + 历史消息 + user(当前问题)
     """
-    # 1. 把检索到的 chunk 拼成带编号的参考资料，注入 system prompt
-    context = prompts.build_context(chunks)
-    messages = [
-        {"role": "system", "content": prompts.RAG_SYSTEM_PROMPT.format(context=context)}
-    ]
+    # 1. 组装 system prompt：有参考资料用 RAG 模板；为空（闲聊/未命中）用兜底模板
+    if chunks:
+        system_content = prompts.RAG_SYSTEM_PROMPT.format(
+            context=prompts.build_context(chunks)
+        )
+    else:
+        system_content = prompts.NO_CONTEXT_SYSTEM_PROMPT
+    messages = [{"role": "system", "content": system_content}]
     # 2. 追加最近 N 轮对话历史（W4 才有真实历史，现在传空列表即可）
     messages.extend(history)
     # 3. 用户当前问题放最后

@@ -1,23 +1,1 @@
-"""
-【W3】BM25 关键词检索：弥补纯向量检索对专有名词/精确匹配的短板。
-依赖：rank_bm25；中文需先分词（jieba）。
-注意：BM25 索引是内存结构，服务重启后需从 MySQL/Chroma 里的 chunk 重建；
-     删除文档时要同步剔除对应 chunk（面试可能问"索引一致性怎么保证"）。
-"""
-# TODO(W3):
-# import jieba
-# from rank_bm25 import BM25Okapi
-# 维护全局: _chunks: list[dict]（含 document_id）, _bm25: BM25Okapi | None
-# 函数: add_chunks(document_id, chunks) / search(query, top_k) / delete_by_document(id) / rebuild()
-
-
-def add_chunks(document_id: int, chunks: list[dict]):
-    raise NotImplementedError
-
-
-def search(query: str, top_k: int = 20) -> list[dict]:
-    raise NotImplementedError
-
-
-def delete_by_document(document_id: int):
-    raise NotImplementedError
+"""【W3·Step10】BM25 关键词检索：弥补纯向量检索对专有名词/精确匹配的短板。设计决策：BM25 索引是内存结构，以 Chroma 为【单一数据源】懒加载重建——         不单独持久化，从根上避免"两套索引数据不一致"的问题。依赖：rank_bm25 + jieba（中文必须先分词，BM25 按词统计频率）"""import jiebafrom rank_bm25 import BM25Okapifrom app.config import settingsfrom app.rag import vector_storeclass BM25Index:    """内存 BM25 索引：chunk 列表 + BM25Okapi 实例。"""    def __init__(self, chunks: list[dict]):        self.rebuild(chunks)    @staticmethod    def _tokenize(text: str) -> list[str]:        # jieba 把中文句子切成词序列，过滤空白符        return [w for w in jieba.lcut(text) if w.strip()]    def rebuild(self, chunks: list[dict]):        self._chunks = chunks        self._bm25 = (            BM25Okapi([self._tokenize(c["content"]) for c in chunks]) if chunks else None        )    def search(self, query: str, top_k: int) -> list[dict]:        """返回 [{content, filename, page, document_id, bm25_score}]，按分数降序。        分数 <= 0 的（零关键词重叠）直接丢弃——这是闲聊问题的天然过滤器。"""        if not self._bm25:            return []        scores = self._bm25.get_scores(self._tokenize(query))        ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)        hits = []        for i in ranked[:top_k]:            if scores[i] <= 0:                break  # 后面的只会更低            hits.append({**self._chunks[i], "bm25_score": round(float(scores[i]), 4)})        return hits_index: BM25Index | None = None  # 懒加载单例def _get_index() -> BM25Index:    """首次使用时从 Chroma 全量重建（单一数据源，永远一致）。"""    global _index    if _index is None:        _index = BM25Index(vector_store.get_all_chunks())    return _indexdef search(query: str, top_k: int | None = None) -> list[dict]:    return _get_index().search(query, top_k or settings.BM25_TOP_K)def rebuild():    """文档增删后调用：从 Chroma 重新全量构建（数据量小时最简单可靠的一致性方案）。"""    global _index    _index = BM25Index(vector_store.get_all_chunks())

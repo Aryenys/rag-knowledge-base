@@ -75,6 +75,20 @@ def count() -> int:
     return _collection.count()
 
 
+def get_all_chunks() -> list[dict]:
+    """取出库中全部 chunk（内容+元数据）。BM25 索引以 Chroma 为单一数据源重建用。"""
+    result = _collection.get(include=["documents", "metadatas"])
+    chunks = []
+    for doc, meta in zip(result["documents"], result["metadatas"]):
+        chunks.append({
+            "content": doc,
+            "filename": meta["filename"],
+            "page": None if meta["page"] == -1 else meta["page"],
+            "document_id": meta["document_id"],
+        })
+    return chunks
+
+
 if __name__ == "__main__":
     # W1 闭环测试：
     #   入库: python -m app.rag.vector_store add data/你的文件.pdf 1

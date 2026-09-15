@@ -28,6 +28,7 @@ class Settings:
     VECTOR_TOP_K: int = int(os.getenv("VECTOR_TOP_K", "20"))   # 向量召回数量
     BM25_TOP_K: int = int(os.getenv("BM25_TOP_K", "20"))       # BM25 召回数量
     RERANK_TOP_K: int = int(os.getenv("RERANK_TOP_K", "5"))    # rerank 后保留数量
+    SIMILARITY_THRESHOLD: float = float(os.getenv("SIMILARITY_THRESHOLD", "0.5"))  # 相似度阈值，低于则视为无关召回
 
     # ---------- 数据库 ----------
     DATABASE_URL: str = os.getenv(

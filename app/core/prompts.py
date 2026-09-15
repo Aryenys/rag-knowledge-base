@@ -32,6 +32,13 @@ QUERY_REWRITE_PROMPT = """根据以下对话历史，把用户的最新问题改
 改写后的问题："""
 
 
+# ---------- 无检索结果兜底 Prompt（相似度过滤后 chunks 为空时用） ----------
+NO_CONTEXT_SYSTEM_PROMPT = """你是企业知识库助手。当前知识库中没有检索到与用户问题相关的内容。
+如果用户是在闲聊（打招呼、问候等），请友好、简短地回应。
+如果用户在提问知识性问题，请明确告知"知识库中未找到相关内容"，并建议用户换一种问法或确认相关文档是否已上传。
+不要编造知识库中不存在的内容。"""
+
+
 def build_context(chunks: list[dict]) -> str:
     """把 rerank 后的 top-K chunk 拼成带编号的参考资料文本。
     chunks 元素格式: {"content": str, "filename": str, "page": int|None}
