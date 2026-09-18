@@ -21,3 +21,7 @@ logs/
 tests/
 scripts/
 *.md
+
+# 本地学习与求职文档（面试题合集、简历草稿）：不随镜像分发
+docs/
+.docx_build/
