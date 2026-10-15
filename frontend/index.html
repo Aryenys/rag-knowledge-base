@@ -299,6 +299,14 @@ async function send() {
   }
 }
 
+// 把外部内容（文件名、文档片段等）拼进 innerHTML 之前必须转义，防止存储型 XSS。
+// 原理：把 & < > " ' 这五个字符换成 HTML 实体，浏览器就只当纯文本显示，不会当成标签执行。
+function escapeHtml(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+
 function renderSources(botEl, sources) {
   if (!sources || sources.length === 0) return;
   const box = document.createElement("div");
@@ -307,9 +315,10 @@ function renderSources(botEl, sources) {
   for (const s of sources) {
     const item = document.createElement("div");
     item.className = "source-item";
-    const pageText = s.page ? " 第" + s.page + "页" : "";
-    item.innerHTML = "<b>[" + s.index + "]</b> " + s.filename + pageText +
-                     "（相关分 " + s.score + "）<br>" + s.content.slice(0, 80) + "...";
+    const pageText = s.page ? " 第" + escapeHtml(s.page) + "页" : "";
+    // s.filename / s.content 来自用户上传的文档，属于不可信内容，必须先转义再拼接
+    item.innerHTML = "<b>[" + escapeHtml(s.index) + "]</b> " + escapeHtml(s.filename) + pageText +
+                     "（相关分 " + escapeHtml(s.score) + "）<br>" + escapeHtml(s.content.slice(0, 80)) + "...";
     box.appendChild(item);
   }
   botEl.appendChild(box);
@@ -338,8 +347,9 @@ async function loadDocs() {
     // created_at 是 UTC 的 ISO 字符串（结尾带 Z），必须交给 Date 按浏览器本地时区换算。
     // 以前直接 .slice(0,16) 截取字符串，等于把 UTC 挂钟时间当成北京时间显示，整整差 8 小时。
     const time = new Date(d.created_at).toLocaleString("zh-CN", { hour12: false });
-    item.innerHTML = '<span class="name">' + d.filename + '</span>' +
-                     '<span class="meta">' + d.chunk_count + ' 块 · ' + time + '</span>';
+    // d.filename 来自用户上传的文件名，属于不可信内容，必须先转义再拼接
+    item.innerHTML = '<span class="name">' + escapeHtml(d.filename) + '</span>' +
+                     '<span class="meta">' + escapeHtml(d.chunk_count) + ' 块 · ' + time + '</span>';
     const del = document.createElement("button");
     del.className = "doc-del";
     del.textContent = "删除";
