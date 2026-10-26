@@ -14,6 +14,7 @@
 - [核心特性](#核心特性)
 - [检索链路设计](#检索链路设计)
 - [Agent 模式（工具调用）](#agent-模式工具调用)
+- [MCP Server（对外暴露工具）](#mcp-server对外暴露工具)
 - [检索效果对比](#检索效果对比)
 - [技术栈与选型理由](#技术栈与选型理由)
 - [项目结构](#项目结构)
@@ -36,6 +37,7 @@
 | **流式输出** | SSE 逐 token 推送，配 `X-Accel-Buffering: no` 防止反向代理缓冲导致"假流式" |
 | **多轮对话** | LLM 查询改写做指代消解（"它怎么样" → 完整问题）；改写只用于检索，回答仍用原话 |
 | **Agent 模式** | 模型自主决定「直接回答 / 调检索工具 / 调统计工具」，支持多轮工具调用，前端实时展示工具调用过程 |
+| **MCP Server** | 同一套工具以 MCP 协议对外暴露，Claude Desktop / Cursor 等任意 MCP 客户端可直接查询本知识库 |
 | **引用溯源** | 每条回答附带引用片段（文件名 + 页码 + 原文截取），点击可定位到原文位置 |
 | **会话持久化** | MySQL 存储会话/消息/文档元数据，外键级联删除 |
 | **评估体系** | LLM 自动合成评测集 + Recall@5 / MRR 双指标，可复跑验证任何检索改动 |
@@ -195,6 +197,111 @@ app/agent/
 
 ---
 
+## MCP Server（对外暴露工具）
+
+Agent 模式解决的是"**我自己**的问答服务能调工具"。
+如果想让 **Claude Desktop / Cursor / Cline** 这些外部 AI 应用也来查我们的知识库呢？
+按老办法，每个应用的工具格式都不一样，得各写一套适配代码。
+
+MCP（Model Context Protocol）就是为了消灭这件事：我只需要写**一个** server，
+所有支持 MCP 的客户端都能直接连。它常被称为"AI 应用的 USB-C 接口"，
+本质是把 **N×M 的适配问题**（N 个应用 × M 个数据源）降成 **N+M**。
+
+```
+                        ┌──────────────────────────┐
+  自家前端  ──HTTP/SSE──▶│   app/agent  (任务1)      │
+                        │   OpenAI tool_calling    │
+                        └────────────┬─────────────┘
+                                     │ 同一个 run_tool
+外部客户端 ──stdio/JSON-RPC──▶┌──────┴──────────────┐
+  Claude Desktop / Cursor    │  mcp_server (任务2) │
+                             └─────────────────────┘
+```
+
+**关键：两条路调用的是同一个 `app/agent/tools.py` 里的 `run_tool`。**
+业务逻辑只有一份，MCP server 只是一层协议外壳，没有复制任何检索代码。
+
+### 启动
+
+```bash
+# 独立 stdio 进程，由 MCP 客户端拉起，也可以手动跑起来看日志
+python -m mcp_server.server
+
+# 冒烟测试：用真实 MCP 客户端连真实 server，验证握手 / 工具发现 / 工具调用
+python -m tests.test_mcp_server
+```
+
+### 客户端配置
+
+**Claude Desktop**（`claude_desktop_config.json`）：
+
+```json
+{
+  "mcpServers": {
+    "rag-knowledge-base": {
+      "command": "D:/rag-knowledge-base/.venv/Scripts/python.exe",
+      "args": ["-m", "mcp_server.server"],
+      "cwd": "D:/rag-knowledge-base"
+    }
+  }
+}
+```
+
+**Cursor**（`.cursor/mcp.json`，项目级）：
+
+```json
+{
+  "mcpServers": {
+    "rag-knowledge-base": {
+      "command": "D:/rag-knowledge-base/.venv/Scripts/python.exe",
+      "args": ["-m", "mcp_server.server"],
+      "cwd": "D:/rag-knowledge-base"
+    }
+  }
+}
+```
+
+> 必须把 `command` 指向装了依赖的那个 `python.exe`（虚拟环境里的），
+> 用系统 Python 会报 `ModuleNotFoundError: No module named 'mcp'`。
+
+### 暴露的工具
+
+| 工具 | 参数 | 说明 |
+| :--- | :--- | :--- |
+| `search_knowledge_base` | `query` | 检索知识库正文，返回带编号的参考资料文本 |
+| `get_knowledge_base_stats` | 无 | 文档总数、切片总数、文件清单 |
+
+### 两个 stdio 特有的坑
+
+**① stdout 只能给协议用**
+stdio 传输下客户端通过进程的**标准输出**读 JSON-RPC 报文，
+业务代码里任何一句 `print` 都会插进这条流。项目里 `embedder.py` 就有
+`print("embedding 第 x/y 批...")`，实测不加处理时客户端直接报：
+
+```
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xb5 in position 12
+```
+
+（中文 print 按 GBK 写进 stdout，客户端按 UTF-8 解码失败。）
+解法：工具执行期间用 `contextlib.redirect_stdout(sys.stderr)` 把 print 引到 stderr，
+**执行完立即恢复**，这样不会影响 MCP SDK 自己往 stdout 写报文。
+
+**② `.env` 加载依赖工作目录**
+客户端拉起进程时 cwd 是不确定的，`app/config.py` 里无参数的 `load_dotenv()` 会找不到 `.env`，
+导致所有 API key 为空。解法：在 `import app.*` **之前**，
+用 `Path(__file__).resolve()` 算出项目根并显式 `load_dotenv(PROJECT_ROOT / ".env")`。
+
+### 代码位置
+
+```
+mcp_server/
+├── __init__.py           # 包说明：与 app/agent 的分工
+└── server.py             # MCPServer 实例 + 两个工具 + stdio 入口
+tests/test_mcp_server.py  # 冒烟测试：真实客户端连真实 server
+```
+
+---
+
 ## 检索效果对比
 
 评测集：由 LLM 从真实文档切片自动合成的 **92 条**问答对（`data/eval_set.json`），
@@ -247,6 +354,7 @@ python -m scripts.build_eval_set   # 每篇文档追加合成到 10 条，增量
 | Rerank | BGE-Reranker-v2-m3（硅基流动 API） | 中文 cross-encoder 里性价比高，不需要本地 GPU |
 | 生成模型 | DeepSeek | 兼容 OpenAI SDK（`openai` 包换 `base_url` 即可），成本低、中文能力强 |
 | 元数据库 | MySQL 8.x + SQLAlchemy 2.0 | 文档/会话/消息是强结构化关系数据；用 ORM 而非裸 SQL，避免拼接注入 |
+| 工具协议 | MCP（官方 Python SDK `mcp`） | 一份 server 对接所有 MCP 客户端，把 N×M 适配降成 N+M；stdio 传输，零端口占用 |
 | 容器编排 | Docker Compose | 一条命令拉起全部依赖，healthcheck 解决服务启动顺序问题 |
 
 **为什么不用 PostgreSQL + pgvector？**
@@ -291,7 +399,12 @@ rag-knowledge-base/
 │       ├── document_service.py    # 入库业务编排
 │       └── document_repository.py # 文档元数据 DAO
 ├── frontend/index.html            # 单文件前端（会话侧边栏 + 流式渲染 + 引用面板）
-├── tests/evaluate.py              # Recall@5 / MRR 评估脚本
+├── mcp_server/
+│   ├── __init__.py                # 包说明：与 app/agent 的分工
+│   └── server.py                  # MCPServer 实例 + 工具注册 + stdio 入口
+├── tests/
+│   ├── evaluate.py                # Recall@5 / MRR 评估脚本
+│   └── test_mcp_server.py         # MCP 冒烟测试：真实客户端连真实 server
 ├── scripts/                       # 开发运维脚本（不入生产镜像）
 │   ├── start_mysql.bat            # 一键启动本机 MySQL（自动申请管理员权限）
 │   ├── build_eval_set.py          # LLM 合成评测集
@@ -392,6 +505,7 @@ uvicorn app.main:app --reload --port 8000
 | `CHROMA_DIR` | `data/chroma` | Chroma 持久化目录 |
 | `HISTORY_TURNS` | `5` | 多轮对话携带的历史轮数 |
 | `AGENT_MAX_TOOL_ROUNDS` | `3` | Agent 模式最大工具调用轮数（防死循环硬闸门） |
+| `MCP_TRANSPORT` | `stdio` | MCP Server 传输方式，客户端直连时用 stdio |
 | `MYSQL_ROOT_PASSWORD` | `password` | 仅 Docker 部署用，compose 里的默认值 |
 
 > ⚠️ `.env` 已在 `.gitignore` 和 `.dockerignore` 中排除，**切勿提交密钥到仓库**。
@@ -602,7 +716,7 @@ netstat -ano | findstr ":3306"
 - [ ] **用户体系**：多租户隔离 + 文档权限控制
 - [ ] **向量库迁移**：数据量到百万级后从 Chroma 迁到 Milvus / Qdrant
 - [ ] **答案质量评估**：接入 RAGAS 做忠实度（Faithfulness）与答案相关性评估，不只评估检索环节
-- [ ] **MCP Server 封装**：把 Agent 工具封装成 MCP Server，让 Claude Desktop / Cursor 直接调用本知识库
+- [x] **MCP Server 封装**：`mcp_server/` 已把 Agent 工具封装成 MCP Server，Claude Desktop / Cursor 可直接调用本知识库
 - [ ] **Agent 答案缓存**：对相同/高度相似的 query 缓存最终答案，降低重复检索与 LLM 成本
 - [ ] **Prompt 版本管理**：提示词抽成带版本号的配置文件，评测脚本支持按版本跑回归对比
 - [ ] **结构化输出**：用 JSON Schema 约束模型输出（答案正文 + 引用列表），前端按结构化结果渲染

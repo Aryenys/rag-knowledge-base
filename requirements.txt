@@ -23,3 +23,7 @@ rank-bm25                 # BM25（W3）
 # 数据库（W4）
 sqlalchemy>=2.0
 pymysql                   # MySQL 驱动
+
+# MCP Server（任务2：对外暴露工具，给 Claude Desktop / Cursor 等客户端用）
+# 注意：mcp 2.x 里 FastMCP 已改名 MCPServer，本项目的 server.py 用的是新名
+mcp>=2.0
