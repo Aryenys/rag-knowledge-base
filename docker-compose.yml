@@ -42,6 +42,8 @@ services:
       # 在容器网络里 localhost 指的是容器自己，写 localhost 会连不上数据库
       DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-password}@mysql:3306/rag_kb?charset=utf8mb4
       TZ: Asia/Shanghai
+      # Agent 模式最大工具调用轮数（防死循环硬闸门），与 app/config.py 的默认值一致
+      AGENT_MAX_TOOL_ROUNDS: ${AGENT_MAX_TOOL_ROUNDS:-3}
     ports:
       - "8000:8000"
     volumes:

@@ -5,6 +5,7 @@
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
+from app.agent import agent_service
 from app.models.schemas import ChatRequest, SessionInfo, MessageInfo
 from app.services import chat_service, session_service
 
@@ -16,12 +17,21 @@ async def chat_stream(req: ChatRequest):
     """
     流式问答（SSE）。
     数据帧格式约定（前端按此解析）：
+      - data: {"type": "session", "id": 1}              会话 id（首帧）
       - data: {"type": "token",   "content": "..."}   逐 token 推送
+      - data: {"type": "tool",    "name": "...", "arguments": {...}, "round": 1}   【Agent】工具调用
+      - data: {"type": "tool_result", "name": "...", "summary": "...", "round": 1} 【Agent】工具结果摘要
       - data: {"type": "sources", "content": [...]}   生成完毕后推送引用来源
       - data: {"type": "done"}                          结束帧
     """
+    # agent=true 走 Agent 决策层；默认仍走原链路，保证老前端与老调用方行为不变
+    stream = (
+        agent_service.stream_agent_answer(req.question, req.session_id)
+        if req.agent
+        else chat_service.stream_answer(req.question, req.session_id)
+    )
     return StreamingResponse(
-        chat_service.stream_answer(req.question, req.session_id),
+        stream,
         media_type="text/event-stream",  # 告诉浏览器这是 SSE 协议
         headers={
             "Cache-Control": "no-cache",   # 禁止缓存，保证实时性

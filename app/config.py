@@ -43,5 +43,10 @@ class Settings:
     # ---------- 对话记忆 ----------
     HISTORY_TURNS: int = int(os.getenv("HISTORY_TURNS", "5"))        # 携带最近 N 轮历史
 
+    # ---------- Agent（任务1） ----------
+    # 工具调用最大轮数：防死循环硬闸门。达到上限后不再把 tools 传给模型，
+    # 模型没有工具可调，只能基于已有信息给最终答案。
+    AGENT_MAX_TOOL_ROUNDS: int = int(os.getenv("AGENT_MAX_TOOL_ROUNDS", "3"))
+
 
 settings = Settings()

@@ -13,6 +13,7 @@
 
 - [核心特性](#核心特性)
 - [检索链路设计](#检索链路设计)
+- [Agent 模式（工具调用）](#agent-模式工具调用)
 - [检索效果对比](#检索效果对比)
 - [技术栈与选型理由](#技术栈与选型理由)
 - [项目结构](#项目结构)
@@ -34,6 +35,7 @@
 | **Cross-Encoder 精排** | 召回 20 条 → BGE-Reranker-v2-m3 精排取 5 条，前端展示的分数就是它的权威分 |
 | **流式输出** | SSE 逐 token 推送，配 `X-Accel-Buffering: no` 防止反向代理缓冲导致"假流式" |
 | **多轮对话** | LLM 查询改写做指代消解（"它怎么样" → 完整问题）；改写只用于检索，回答仍用原话 |
+| **Agent 模式** | 模型自主决定「直接回答 / 调检索工具 / 调统计工具」，支持多轮工具调用，前端实时展示工具调用过程 |
 | **引用溯源** | 每条回答附带引用片段（文件名 + 页码 + 原文截取），点击可定位到原文位置 |
 | **会话持久化** | MySQL 存储会话/消息/文档元数据，外键级联删除 |
 | **评估体系** | LLM 自动合成评测集 + Recall@5 / MRR 双指标，可复跑验证任何检索改动 |
@@ -94,6 +96,102 @@ rrf_score = Σ  1 / (60 + rank)     # 60 是平滑常数，防止头部排名权
 RRF 融合是**无监督**的启发式规则，它不知道哪条真的更相关。BM25 路召回的内容常常只是关键词碰上了，
 实际答非所问 —— 这些噪声会污染 RRF 的排名。**实测数据证明了这一点**（详见下一节）：
 混合召回单独使用反而比纯向量**更差**，加上 Rerank 之后才反超。
+
+---
+
+## Agent 模式（工具调用）
+
+普通模式是**固定链路**：每次提问必检索 → 拼上下文 → 生成。哪怕问"你好"，也要付一次检索成本。
+
+Agent 模式把「要不要检索」这个决定权交给模型，它自己判断该直接回答、还是调用工具。
+通过接口参数 `agent=true` 切换，**默认行为不变**，老调用方完全不受影响。
+
+```bash
+curl -X POST http://localhost:8000/api/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"question":"知识库里一共有几份文档？","agent":true}'
+```
+
+### 两个内置工具
+
+| 工具 | 参数 | 返回 | 典型触发场景 |
+| :--- | :--- | :--- | :--- |
+| `search_knowledge_base` | `query`（必填） | 命中的文档片段 + 带编号的参考资料文本 | "BGE-M3 论文讲了什么"、"MySQL.md 里怎么建索引" |
+| `get_knowledge_base_stats` | 无 | 文档总数、切片总数、文件清单 | "有几份文档"、"装了哪些文件" |
+
+**检索工具内部完整复用现有 RAG 链路**（混合召回 → 相似度阈值过滤 → Rerank 精排），
+不另写一套检索逻辑，因此 Agent 模式的答案质量与普通模式一致。
+
+### 工作流程
+
+```
+用户提问
+  │
+  ├─ 载入最近 N 轮历史 + AGENT_SYSTEM_PROMPT
+  │
+  ▼
+┌─────────────────────────────────┐
+│ 调 LLM（带 tools 参数）          │
+│ tool_choice="auto" → 模型自决    │
+└─────────────────────────────────┘
+  │
+  ├─ 模型输出 tool_calls？
+  │    ├─ 否 → 直接输出答案 → 流式推送 → 结束
+  │    └─ 是 ↓
+  │
+  ├─ 执行工具 → 回填 role=tool 消息 → 再次调 LLM（最多 3 轮）
+  │
+  ▼
+生成答案 + 引用来源 → 落库 → 结束
+```
+
+### 三个关键设计
+
+**① 防死循环硬闸门**
+`AGENT_MAX_TOOL_ROUNDS`（默认 3）控制最大工具调用轮数。达到上限后**不再把 `tools` 传给模型**——
+没有工具可调，模型只能基于已有信息给出最终答案。这比"提示模型别乱调"可靠得多：
+提示词约束是软约束，参数控制是硬约束。
+
+**② OpenAI 协议的强制回填顺序**
+assistant 的 `tool_calls` 消息必须先回填，再逐条回填 `role=tool` 的工具结果，
+且每条工具结果的 `tool_call_id` 必须与对应的 `tool_calls[].id` 匹配，否则下一轮请求会被 API 拒绝。
+
+**③ 流式与工具调用共用一次请求**
+`delta.content` 直接转发前端（保住打字机体验），`delta.tool_calls` 按 `index` 分片累积拼接
+（OpenAI 会把工具名和参数拆成多片推送）。因此"模型直接回答"时**不会多发一次请求**。
+
+### 工具调用的实际表现
+
+| 问题 | 模型选择的工具 | 结果 |
+| :--- | :--- | :--- |
+| 你好，今天天气怎么样？ | 无（直接回答） | 闲聊不触发检索，不浪费成本 |
+| 知识库里一共有几份文档？ | `get_knowledge_base_stats` | 正确返回 7 份文档 / 462 个切片及完整清单 |
+| BGE-M3 论文讲了什么？ | `search_knowledge_base` | 召回相关片段并标注引用编号 |
+| MySQL.md 里怎么建索引？ | `search_knowledge_base` | 召回索引相关内容 |
+
+工具执行失败时（如 embedding 服务不可用），错误会被转成**工具结果文本回填给模型**，
+由模型决定换 query 重试还是如实说明——不会让整个问答请求 500。
+
+### 新增的 SSE 帧
+
+Agent 模式比普通模式多两种帧，前端据此展示"调用了什么工具"的过程：
+
+```
+data: {"type": "tool",        "name": "search_knowledge_base", "arguments": {"query":"RAG"}, "round": 1}
+data: {"type": "tool_result", "name": "search_knowledge_base", "summary": "检索「RAG」：命中 5 条片段", "round": 1}
+```
+
+`tool` 帧在工具执行前推送（展示调用了什么、传了什么参数），
+`tool_result` 帧在执行后推送（展示结果摘要）。普通模式的帧序列完全不变。
+
+### 代码位置
+
+```
+app/agent/
+├── __init__.py           # 包说明
+├── tools.py              # 工具层：JSON Schema 定义 + 两个工具实现 + 统一分发入口
+└── agent_service.py      # 决策层：工具调用循环、流式转发、防死循环闸门
+```
 
 ---
 
@@ -184,6 +282,9 @@ rag-knowledge-base/
 │   │   ├── retriever.py           # 双路召回 + RRF 融合
 │   │   ├── reranker.py            # cross-encoder 精排
 │   │   └── generator.py           # 流式生成 + 查询改写
+│   ├── agent/
+│   │   ├── tools.py               # 工具层：JSON Schema + 检索/统计工具 + 统一分发
+│   │   └── agent_service.py       # 决策层：工具调用循环 + 防死循环闸门 + 流式转发
 │   └── services/
 │       ├── chat_service.py        # 问答主链路编排（0→8 步）
 │       ├── session_service.py     # 会话 DAO（含事务边界）
@@ -290,6 +391,7 @@ uvicorn app.main:app --reload --port 8000
 | `DATA_DIR` | `data` | 上传文件存放目录 |
 | `CHROMA_DIR` | `data/chroma` | Chroma 持久化目录 |
 | `HISTORY_TURNS` | `5` | 多轮对话携带的历史轮数 |
+| `AGENT_MAX_TOOL_ROUNDS` | `3` | Agent 模式最大工具调用轮数（防死循环硬闸门） |
 | `MYSQL_ROOT_PASSWORD` | `password` | 仅 Docker 部署用，compose 里的默认值 |
 
 > ⚠️ `.env` 已在 `.gitignore` 和 `.dockerignore` 中排除，**切勿提交密钥到仓库**。
@@ -318,9 +420,21 @@ uvicorn app.main:app --reload --port 8000
 | `GET` | `/api/chat/sessions/{id}/messages` | 历史消息（回看旧会话，含引用来源） |
 | `DELETE` | `/api/chat/sessions/{id}` | 删除会话（消息级联删除） |
 
+`POST /api/chat/stream` 请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `question` | string | 必填 | 用户问题 |
+| `session_id` | int \| null | null | 为空表示新建会话，首帧返回新 id |
+| `agent` | bool | **false** | 是否启用 Agent 模式（模型自主决定是否调用工具） |
+
 ### SSE 帧格式约定
 
+普通模式（`agent` 不传或 false）：
+
 ```
+data: {"type": "session", "id": 1}
+
 data: {"type": "token",   "content": "回答的一个片段"}
 
 data: {"type": "sources", "content": [{"index":1,"filename":"xx.pdf","page":3,"score":0.87,...}]}
@@ -328,7 +442,16 @@ data: {"type": "sources", "content": [{"index":1,"filename":"xx.pdf","page":3,"s
 data: {"type": "done"}
 ```
 
-前端依次处理：`token` 追加渲染 → `sources` 渲染引用面板 → `done` 结束加载态。
+Agent 模式（`agent=true`）在上述基础上**多两种帧**，用于展示工具调用过程：
+
+```
+data: {"type": "tool",        "name": "search_knowledge_base", "arguments": {"query":"RAG"}, "round": 1}
+
+data: {"type": "tool_result", "name": "search_knowledge_base", "summary": "检索「RAG」：命中 5 条片段", "round": 1}
+```
+
+前端依次处理：`session` 记录会话 id → `tool` / `tool_result` 渲染工具调用过程 →
+`token` 追加渲染 → `sources` 渲染引用面板 → `done` 结束加载态。
 
 ### 健康检查
 
@@ -479,6 +602,10 @@ netstat -ano | findstr ":3306"
 - [ ] **用户体系**：多租户隔离 + 文档权限控制
 - [ ] **向量库迁移**：数据量到百万级后从 Chroma 迁到 Milvus / Qdrant
 - [ ] **答案质量评估**：接入 RAGAS 做忠实度（Faithfulness）与答案相关性评估，不只评估检索环节
+- [ ] **MCP Server 封装**：把 Agent 工具封装成 MCP Server，让 Claude Desktop / Cursor 直接调用本知识库
+- [ ] **Agent 答案缓存**：对相同/高度相似的 query 缓存最终答案，降低重复检索与 LLM 成本
+- [ ] **Prompt 版本管理**：提示词抽成带版本号的配置文件，评测脚本支持按版本跑回归对比
+- [ ] **结构化输出**：用 JSON Schema 约束模型输出（答案正文 + 引用列表），前端按结构化结果渲染
 
 ---
 

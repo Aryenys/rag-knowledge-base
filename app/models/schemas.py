@@ -18,6 +18,9 @@ class DocumentInfo(BaseModel):
 class ChatRequest(BaseModel):
     question: str
     session_id: int | None = None   # 为空表示新会话
+    # Agent 模式开关：默认 False = 走原有"检索->生成"链路，行为完全不变；
+    # 传 true 才进入 Agent 决策层，由模型自行判断是否调用工具
+    agent: bool = False
 
 
 class SourceChunk(BaseModel):

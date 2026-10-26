@@ -113,6 +113,19 @@
     padding: 0 22px; font-size: 14px; cursor: pointer;
   }
   #send-btn:disabled { background: #b9c8f5; cursor: not-allowed; }
+  /* Agent 模式开关：默认不勾选 = 走原有检索链路 */
+  #agent-toggle {
+    max-width: 860px; margin: 8px auto 0; display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: #888; cursor: pointer; user-select: none;
+  }
+  /* Agent 工具调用过程展示（独立于回答气泡，避免被 textContent 覆盖） */
+  .tool-trace {
+    max-width: 860px; margin: 4px auto; padding: 8px 12px; display: none;
+    font-size: 12px; color: #666; background: #f6f8ff;
+    border-left: 3px solid #4f7cff; border-radius: 6px; line-height: 1.8;
+  }
+  .tool-line { font-family: ui-monospace, Consolas, monospace; }
+  .tool-result { color: #999; }
 </style>
 </head>
 <body>
@@ -145,6 +158,9 @@
         <textarea id="question" rows="1" placeholder="输入问题，回车发送（Shift+回车换行）"></textarea>
         <button id="send-btn">发送</button>
       </div>
+      <label id="agent-toggle">
+        <input type="checkbox" id="agent-mode"> Agent 模式（模型自主决定是否检索 / 查询知识库统计）
+      </label>
     </div>
   </div>
 </div>
@@ -153,11 +169,18 @@
 const chatEl = document.getElementById("chat");
 const questionEl = document.getElementById("question");
 const sendBtn = document.getElementById("send-btn");
+const agentModeEl = document.getElementById("agent-mode");
 const sessionListEl = document.getElementById("session-list");
 
 // 当前会话 id。null = 还没开始对话，后端收到 null 会自动新建一个会话
 // 并在响应的第一帧把新建的 id 推回来
 let currentSessionId = null;
+
+// 工具名 -> 中文标签：后端传的是函数名，这里翻译成人话显示
+const TOOL_LABELS = {
+  search_knowledge_base: "检索知识库",
+  get_knowledge_base_stats: "查询知识库统计",
+};
 
 function addMsg(role, text) {
   const div = document.createElement("div");
@@ -248,6 +271,12 @@ async function send() {
   const botEl = addMsg("bot", "");
   botEl.classList.add("typing");   // 打字光标
 
+  // Agent 模式下的"工具调用过程"面板，插在回答气泡上方。
+  // 先建好但隐藏，收到 tool 帧再显示并填内容。
+  const traceEl = document.createElement("div");
+  traceEl.className = "tool-trace";
+  botEl.parentNode.insertBefore(traceEl, botEl);
+
   try {
     // ⚠️ 核心：为什么用 fetch 而不是 EventSource？
     // EventSource 只支持 GET，我们的接口是 POST（问题在请求体里）。
@@ -255,8 +284,12 @@ async function send() {
     const resp = await fetch("/api/chat/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // 带上会话 id，后端才知道要把这条消息归到哪次对话里
-      body: JSON.stringify({ question: question, session_id: currentSessionId }),
+      body: JSON.stringify({
+        question: question,
+        session_id: currentSessionId,
+        // Agent 开关：勾选后由模型自行决定是否检索；不勾选走原链路
+        agent: agentModeEl.checked,
+      }),
     });
 
     const reader = resp.body.getReader();
@@ -282,6 +315,24 @@ async function send() {
         } else if (data.type === "token") {
           botEl.textContent += data.content;          // 逐 token 追加 = 打字机
           chatEl.scrollTop = chatEl.scrollHeight;
+        } else if (data.type === "tool") {
+          // 【Agent】模型决定调用某个工具：展示"调用了什么、传了什么参数"
+          traceEl.style.display = "block";
+          const line = document.createElement("div");
+          line.className = "tool-line";
+          const label = TOOL_LABELS[data.name] || data.name;
+          // 参数可能是对象，用 JSON.stringify 展开成可读形式
+          const argText = JSON.stringify(data.arguments || {});
+          line.textContent = "🔧 第" + data.round + "轮 · 调用 " + label + "(" + argText + ")";
+          traceEl.appendChild(line);
+          chatEl.scrollTop = chatEl.scrollHeight;
+        } else if (data.type === "tool_result") {
+          // 【Agent】工具执行完毕：展示结果摘要（如"命中 5 条片段"）
+          const line = document.createElement("div");
+          line.className = "tool-line tool-result";
+          line.textContent = "   ↳ " + data.summary;
+          traceEl.appendChild(line);
+          chatEl.scrollTop = chatEl.scrollHeight;
         } else if (data.type === "sources") {
           renderSources(botEl, data.content);
         } else if (data.type === "done") {
@@ -294,6 +345,8 @@ async function send() {
     botEl.textContent = "出错了: " + err.message;
   } finally {
     botEl.classList.remove("typing");
+    // 非 Agent 模式或出错时，工具面板不该留下空白块
+    if (!traceEl.querySelector(".tool-line")) traceEl.remove();
     sendBtn.disabled = false;
     questionEl.focus();
   }
