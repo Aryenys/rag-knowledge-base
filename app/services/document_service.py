@@ -11,6 +11,7 @@ W4 升级点：元数据从 data/documents.json 迁移到 MySQL（接口不变�
 import time
 from pathlib import Path
 
+from app.cache import kb_cache
 from app.config import settings
 from app.rag import loader, splitter, embedder, vector_store, bm25_store
 from app.services import document_repository
@@ -41,7 +42,12 @@ def ingest_document(filename: str, content: bytes, suffix: str) -> dict:
         bm25_store.rebuild()
 
         # 5. 标记就绪，并补上真实 chunk 数
-        return document_repository.mark_ready(document_id, len(chunks))
+        doc = document_repository.mark_ready(document_id, len(chunks))
+
+        # 6. 知识库内容变了 → 作废指纹，让检索缓存下次自动重算
+        #    （key 里带指纹，指纹一变旧缓存自然读不到，不需要手动清理缓存条目）
+        kb_cache.invalidate_on_kb_change()
+        return doc
 
     except Exception:
         # 失败兜底：标记 failed，并清理可能已写进向量库的一半数据。
@@ -49,6 +55,7 @@ def ingest_document(filename: str, content: bytes, suffix: str) -> dict:
         document_repository.mark_failed(document_id)
         vector_store.delete_by_document(document_id)
         bm25_store.rebuild()
+        kb_cache.invalidate_on_kb_change()  # 切片数可能已变，作废指纹
         raise
 
 
@@ -70,4 +77,6 @@ def delete_document(document_id: int) -> bool:
     file_path = Path(doc["file_path"])
     if file_path.exists():
         file_path.unlink()                            # ③ 删磁盘文件
+
+    kb_cache.invalidate_on_kb_change()                # ④ 作废知识库指纹，缓存自动失效
     return True

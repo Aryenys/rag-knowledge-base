@@ -15,6 +15,7 @@
 - [检索链路设计](#检索链路设计)
 - [Agent 模式（工具调用）](#agent-模式工具调用)
 - [MCP Server（对外暴露工具）](#mcp-server对外暴露工具)
+- [缓存设计](#缓存设计)
 - [检索效果对比](#检索效果对比)
 - [技术栈与选型理由](#技术栈与选型理由)
 - [项目结构](#项目结构)
@@ -38,6 +39,7 @@
 | **多轮对话** | LLM 查询改写做指代消解（"它怎么样" → 完整问题）；改写只用于检索，回答仍用原话 |
 | **Agent 模式** | 模型自主决定「直接回答 / 调检索工具 / 调统计工具」，支持多轮工具调用，前端实时展示工具调用过程 |
 | **MCP Server** | 同一套工具以 MCP 协议对外暴露，Claude Desktop / Cursor 等任意 MCP 客户端可直接查询本知识库 |
+| **分层缓存** | 检索结果缓存（默认开）+ 答案缓存（默认关），LRU + TTL 双淘汰，知识库一变自动失效 |
 | **引用溯源** | 每条回答附带引用片段（文件名 + 页码 + 原文截取），点击可定位到原文位置 |
 | **会话持久化** | MySQL 存储会话/消息/文档元数据，外键级联删除 |
 | **评估体系** | LLM 自动合成评测集 + Recall@5 / MRR 双指标，可复跑验证任何检索改动 |
@@ -302,6 +304,122 @@ tests/test_mcp_server.py  # 冒烟测试：真实客户端连真实 server
 
 ---
 
+## 缓存设计
+
+一次检索的耗时几乎全在两次网络 API 上（预热后实测）：
+
+```
+embedding API : 约 3.9 秒
+rerank API    : 约 3.9 秒
+本地计算       : 可忽略
+```
+
+所以缓存省的不是 CPU，是**两次跨网络往返**。命中后延迟降到 0.1 毫秒量级。
+
+### 缓存什么
+
+| 层级 | 缓存内容 | 默认 | 省掉什么 |
+| :--- | :--- | :--- | :--- |
+| **检索结果** | 「召回 → 过滤 → 精排」的最终结果 | 开 | embedding + rerank 两次 API |
+| **答案** | LLM 生成的完整答案 + 引用来源 | 关 | 上面两次 + 整次生成 |
+
+缓存挂在**精排之后**而不是召回之后：只缓存召回结果的话，rerank 那次 API 还是省不掉，只能省一半。
+
+答案缓存默认关闭的原因：生成有随机性（`temperature=0.3`）、回放不是真流式、
+且只在「无历史」时启用（有历史时同一问题的答案依赖上下文，缓存会串台）。
+
+### 三个关键设计
+
+**① LRU 和 TTL 两个都要**
+TTL（默认 300 秒）管"新鲜度"，LRU（默认 500 条）管"容量"。
+只靠 TTL 的话，5 分钟内问一万个不同问题照样撑爆内存——
+TTL 防的是时间上的无限增长，LRU 防的是数量上的无限增长，两者互补。
+
+**② 知识库指纹：缓存最怕的不是慢，是脏**
+上传新文档后同一个问题的正确答案变了，如果 key 只有问题本身，用户会一直拿到旧答案。
+所以 key 里带上知识库指纹：
+
+```python
+key    = md5(f"{scope}|{归一化问题}|kb={指纹}")
+指纹   = f"{文档数}:{切片总数}:{最大文档id}"
+```
+
+指纹一变 → key 一变 → 旧条目自然读不到，**等价于自动失效，不用人工清理**。
+
+**③ 指纹查不到时禁用缓存（降级：宁可慢，不能错）**
+指纹要查 MySQL，MySQL 挂了就不知道知识库有没有变。
+此时**既不读也不写缓存**，直接走真实检索——返回过期答案比慢几秒严重得多。
+统计里单独记了 `disabled` 次数方便监控。
+
+### 实测数据
+
+```bash
+python -m scripts.bench_cache           # 默认取评测集 30 条
+python -m scripts.bench_cache --n 10    # 小样本，跑得快
+python -m scripts.bench_cache --no-cache # 对照组：全程关缓存
+```
+
+压测方法：同一个问题问两遍——第一遍缓存里没有（真实走 API），第二遍命中。
+**先跑一条 warmup**：jieba 加载 + Chroma 初始化的冷启动开销有 8 秒左右，
+不预热的话第一轮数字全被污染，收益会虚高到十几万倍，那是自己骗自己。
+
+`--n 10` 实测（硅基流动 API 当时约 3.9 秒/次，数字会随网络与额度波动）：
+
+| 轮次 | 条数 | 总耗时 | 平均延迟 | P95 | 命中 | 命中率 |
+| :--- | ---: | -----: | -------: | ---: | ---: | -----: |
+| 冷缓存（第 1 遍） | 10 | 77.9s | 7786.4ms | 7927.0ms | 0 | 0% |
+| 热缓存（第 2 遍） | 10 | 0.0s | 0.3ms | 0.0ms | 10 | 100% |
+
+两轮合计：开缓存 77.9s，不开缓存 155.7s，**API 调用从 20 次降到 10 次**。
+
+> ⚠️ 踩过的坑：第一次跑 30 条时命中率是 **0%**——30 条真实检索要 342 秒，
+> 而 TTL 是 300 秒，第一轮还没跑完最早写入的条目就过期了。
+> 这不是缓存没用，是**压测耗时超过了缓存有效期**。
+> 所以压测脚本默认把 TTL 放大到 3600 秒（可用 `--ttl` 覆盖）。
+
+开答案缓存后整轮问答的对比（同一个问题第二次提问）：
+
+```
+第 1 次：session → 53 个 token 帧 → sources → done    11932 ms
+第 2 次：session → cache(检索) → cache(答案) → token → sources → done   24 ms
+```
+
+### 怎么关（一键回滚）
+
+```bash
+CACHE_ENABLED=false   # 所有缓存逻辑直接短路，行为与加缓存前完全一致
+```
+
+因为这个开关的存在，加缓存后**不需要重跑评测集**：
+`app/rag/` 一行没动，评测脚本走的还是原路径，指标不受影响。
+
+### 代码位置
+
+```
+app/cache/
+├── __init__.py          # 包说明：三条设计原则
+└── kb_cache.py          # TTL+LRU 缓存、命中率统计、知识库指纹
+app/services/retrieval_service.py  # 检索编排（召回+过滤+精排），缓存挂在这里
+scripts/bench_cache.py   # 压测脚本
+```
+
+命中率可以在健康检查里直接看：
+
+```bash
+curl localhost:8000/api/health | jq .cache
+# {"enabled": true, "retrieval": {"hits": 30, "misses": 30, "hit_rate": 0.5, ...}}
+```
+
+### 为什么不用 Redis
+
+单机部署（Docker 单容器 + 本地 Chroma），知识库规模十万级以内，
+进程内缓存是纳秒级，Redis 还要多一次网络往返（0.3~1ms）和多运维一个服务。
+
+**代价要说清楚**：多副本部署时各副本缓存不共享，命中率会被副本数稀释。
+到时候换 Redis 即可——接口就是 `get/set/clear`，替换成本很低。
+
+---
+
 ## 检索效果对比
 
 评测集：由 LLM 从真实文档切片自动合成的 **92 条**问答对（`data/eval_set.json`），
@@ -396,12 +514,16 @@ rag-knowledge-base/
 │   └── services/
 │       ├── chat_service.py        # 问答主链路编排（0→8 步）
 │       ├── session_service.py     # 会话 DAO（含事务边界）
+│       ├── retrieval_service.py   # 检索编排（召回+过滤+精排），缓存挂在这里
 │       ├── document_service.py    # 入库业务编排
 │       └── document_repository.py # 文档元数据 DAO
 ├── frontend/index.html            # 单文件前端（会话侧边栏 + 流式渲染 + 引用面板）
 ├── mcp_server/
 │   ├── __init__.py                # 包说明：与 app/agent 的分工
 │   └── server.py                  # MCPServer 实例 + 工具注册 + stdio 入口
+├── app/cache/
+│   ├── __init__.py                # 包说明：缓存层三条设计原则
+│   └── kb_cache.py                # TTL+LRU 缓存、命中率统计、知识库指纹
 ├── tests/
 │   ├── evaluate.py                # Recall@5 / MRR 评估脚本
 │   └── test_mcp_server.py         # MCP 冒烟测试：真实客户端连真实 server
@@ -410,6 +532,7 @@ rag-knowledge-base/
 │   ├── build_eval_set.py          # LLM 合成评测集
 │   ├── check_time.py              # 时间链路自检（验证存储确为 UTC）
 │   ├── check_vector.py            # 向量库 / MySQL / 磁盘 三处数据一致性对账
+│   └── bench_cache.py             # 缓存压测：冷/热两轮对比，出命中率与加速比
 │   ├── check_db.py                # 数据库表内容速览
 │   ├── fix_legacy_time.py         # 历史时间偏移订正（带 dry-run）
 │   ├── init_mysql.py              # 建库
@@ -506,6 +629,11 @@ uvicorn app.main:app --reload --port 8000
 | `HISTORY_TURNS` | `5` | 多轮对话携带的历史轮数 |
 | `AGENT_MAX_TOOL_ROUNDS` | `3` | Agent 模式最大工具调用轮数（防死循环硬闸门） |
 | `MCP_TRANSPORT` | `stdio` | MCP Server 传输方式，客户端直连时用 stdio |
+| `CACHE_ENABLED` | `true` | 缓存总开关，关掉后行为与加缓存前完全一致（可一键回滚） |
+| `CACHE_TTL` | `300` | 单条缓存存活秒数 |
+| `CACHE_MAX_ENTRIES` | `500` | 缓存最多存多少条，超出按 LRU 淘汰 |
+| `KB_FINGERPRINT_TTL` | `10` | 知识库指纹的本地缓存秒数（避免每次检索都查库） |
+| `CACHE_ANSWER_ENABLED` | `false` | 答案缓存开关，默认关（生成有随机性，且回放非真流式） |
 | `MYSQL_ROOT_PASSWORD` | `password` | 仅 Docker 部署用，compose 里的默认值 |
 
 > ⚠️ `.env` 已在 `.gitignore` 和 `.dockerignore` 中排除，**切勿提交密钥到仓库**。
@@ -567,9 +695,30 @@ data: {"type": "tool_result", "name": "search_knowledge_base", "summary": "检�
 前端依次处理：`session` 记录会话 id → `tool` / `tool_result` 渲染工具调用过程 →
 `token` 追加渲染 → `sources` 渲染引用面板 → `done` 结束加载态。
 
+命中缓存时还会**多一种帧**（在 token 之前到达，前端据此显示"⚡ 缓存命中"徽标）：
+
+```
+data: {"type": "cache", "layer": "retrieval", "hit": true}
+data: {"type": "cache", "layer": "answer",    "hit": true}
+```
+
+`layer=retrieval` 表示省掉了 embedding + rerank，`layer=answer` 表示连生成都省了。
+
 ### 健康检查
 
-`GET /api/health` → `{"status": "ok"}`，被 docker-compose healthcheck 和部署脚本使用。
+`GET /api/health`，被 docker-compose healthcheck 和部署脚本使用。顺带返回缓存命中率：
+
+```json
+{
+  "status": "ok",
+  "cache": {
+    "enabled": true,
+    "answer_enabled": false,
+    "retrieval": {"hits": 30, "misses": 30, "total": 60, "hit_rate": 0.5, "evictions": 0, "expirations": 0, "disabled": 0},
+    "answer": {"hits": 0, "misses": 0, "total": 0, "hit_rate": 0.0, "evictions": 0, "expirations": 0, "disabled": 0}
+  }
+}
+```
 
 ---
 
@@ -717,7 +866,8 @@ netstat -ano | findstr ":3306"
 - [ ] **向量库迁移**：数据量到百万级后从 Chroma 迁到 Milvus / Qdrant
 - [ ] **答案质量评估**：接入 RAGAS 做忠实度（Faithfulness）与答案相关性评估，不只评估检索环节
 - [x] **MCP Server 封装**：`mcp_server/` 已把 Agent 工具封装成 MCP Server，Claude Desktop / Cursor 可直接调用本知识库
-- [ ] **Agent 答案缓存**：对相同/高度相似的 query 缓存最终答案，降低重复检索与 LLM 成本
+- [x] **缓存层**：检索结果缓存（默认开）+ 答案缓存（默认关），LRU+TTL 双淘汰，知识库指纹自动失效，含压测脚本
+- [ ] **相似 query 缓存匹配**：当前是精确匹配，语义相似匹配需要向量近邻检索，性价比待评估
 - [ ] **Prompt 版本管理**：提示词抽成带版本号的配置文件，评测脚本支持按版本跑回归对比
 - [ ] **结构化输出**：用 JSON Schema 约束模型输出（答案正文 + 引用列表），前端按结构化结果渲染
 

@@ -11,10 +11,8 @@ Agent 工具层：把"知识库检索"和"知识库统计"封装成模型可自�
 """
 import json
 
-from app.config import settings
 from app.core import prompts
-from app.rag import reranker, retriever
-from app.services import document_repository
+from app.services import document_repository, retrieval_service
 
 
 # ---------- 工具的 JSON Schema（OpenAI tools 参数格式，随请求发给模型） ----------
@@ -68,17 +66,10 @@ def search_knowledge_base(query: str) -> dict:
       chunks  -> 给前端引用面板用（结构化片段）
       summary -> 给前端工具调用过程展示用（一句话）
     """
-    # 以下检索策略与 chat_service.stream_answer 完全一致：20 条候选 -> 阈值过滤 -> 精排
-    hits = retriever.retrieve(query, final_top_k=20)
-
-    # 向量命中要求相似度达标；BM25 命中代表真实关键词重叠，直接保留
-    hits = [
-        h for h in hits
-        if (h.get("similarity") is not None and h["similarity"] >= settings.SIMILARITY_THRESHOLD)
-        or "bm25" in h.get("sources", [])
-    ]
-    if hits:  # 空候选跳过精排，省一次 API 调用
-        hits = reranker.rerank(query, hits)
+    # 检索策略与 chat_service 完全一致——因为走的是同一个 retrieval_service.search，
+    # 不是复制一份：召回 → 阈值过滤 → 精排，并且自动带上缓存（任务3）。
+    hits, cache_hit = retrieval_service.search(query, final_top_k=20)
+    cache_note = "（缓存命中）" if cache_hit else ""
 
     if not hits:
         return {
@@ -89,7 +80,7 @@ def search_knowledge_base(query: str) -> dict:
     return {
         "context": prompts.build_context(hits),
         "chunks": hits,
-        "summary": f"检索「{query}」：命中 {len(hits)} 条片段",
+        "summary": f"检索「{query}」：命中 {len(hits)} 条片段{cache_note}",
     }
 
 

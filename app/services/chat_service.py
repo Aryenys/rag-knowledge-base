@@ -6,9 +6,10 @@ W4 升级点：读写 MySQL 会话与消息
 """
 import json
 
+from app.cache import kb_cache
 from app.config import settings
-from app.rag import generator, retriever, reranker
-from app.services import session_service
+from app.rag import generator
+from app.services import retrieval_service, session_service
 
 
 def stream_answer(question: str, session_id: int | None):
@@ -38,21 +39,35 @@ def stream_answer(question: str, session_id: int | None):
     #    改写后的问题只用于"找资料"，生成回答仍用用户原话
     standalone_q = generator.rewrite_query(question, history)
 
-    # 4. 检索：向量 + BM25 混合召回 20 条候选（召回求广）
+    # 4. 检索（带缓存）：召回 → 质量过滤 → 精排，三步封装在 retrieval_service 里
     #    ⚠️ 用"改写后的问题"检索，但生成时仍用"原始问题"回答
-    hits = retriever.retrieve(standalone_q, final_top_k=20)
+    #    命中缓存时会直接返回上次的结果，省掉 embedding 和 rerank 两次 API 调用
+    hits, retrieval_cache_hit = retrieval_service.search(standalone_q, final_top_k=20)
+    if retrieval_cache_hit:
+        # 单独推一帧，前端据此显示"缓存命中"徽标（在回答出来之前就能看到）
+        yield _sse({"type": "cache", "layer": "retrieval", "hit": True})
 
-    # 4.5 质量过滤：向量命中要求相似度达标；BM25 命中本身代表真实关键词重叠
-    #     （score>0 才返回，高精度），直接保留。两路都被淘汰 → 走兜底拒答。
-    hits = [
-        h for h in hits
-        if (h.get("similarity") is not None and h["similarity"] >= settings.SIMILARITY_THRESHOLD)
-        or "bm25" in h.get("sources", [])
-    ]
+    # 4.7 【任务3】答案缓存：命中时连 LLM 生成都省掉，直接回放上次的结果。
+    #     ⚠️ 只在「无历史」时启用：有历史时同一个问题的答案依赖上下文，
+    #        不同会话里含义可能完全不同，缓存了会串台。
+    #     默认关闭（CACHE_ANSWER_ENABLED=false）：生成有随机性，且回放是"一次性推完"，
+    #        不是真的流式。只在"同一问题被反复问"的场景才划算，交给部署方决定。
+    answer_key = None
+    if settings.CACHE_ENABLED and settings.CACHE_ANSWER_ENABLED and not history:
+        answer_key = kb_cache.make_key(question, scope="answer")
 
-    # 4.6 【Step11】cross-encoder 精排取 top5（精排求准）；空候选跳过，省一次 API 调用
-    if hits:
-        hits = reranker.rerank(standalone_q, hits)
+    if answer_key:
+        cached = kb_cache.answer_cache.get(answer_key)
+        if cached is not None:
+            yield _sse({"type": "cache", "layer": "answer", "hit": True})
+            # 一次性推完整答案：缓存的价值就是快，没必要为了像打字机而人为 sleep 拖慢
+            yield _sse({"type": "token", "content": cached["answer"]})
+            session_service.save_message(
+                session_id, "assistant", cached["answer"], cached["sources"]
+            )
+            yield _sse({"type": "sources", "content": cached["sources"]})
+            yield _sse({"type": "done"})
+            return
 
     # 5. 流式生成：边收 token 边推帧给前端（生成用原始问题 + 历史）
     full_answer = ""
@@ -75,6 +90,10 @@ def stream_answer(question: str, session_id: int | None):
 
     # 7. 落库助手回答（带上引用来源，回看旧会话时能还原引用面板）
     session_service.save_message(session_id, "assistant", full_answer, sources)
+
+    # 7.5 写答案缓存（引用来源一起存，否则命中时引用面板会是空的）
+    if answer_key:
+        kb_cache.answer_cache.set(answer_key, {"answer": full_answer, "sources": sources})
 
     # 8. 推引用来源 + 结束帧（前端惯例：回答显示完再展开引用面板）
     yield _sse({"type": "sources", "content": sources})

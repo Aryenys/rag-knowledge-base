@@ -18,6 +18,8 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import documents, chat
+from app.cache import kb_cache
+from app.config import settings
 from app.core.database import init_db
 from app.core.logging import get_logger, mute_noisy, setup_logging
 
@@ -95,8 +97,20 @@ app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 
 @app.get("/api/health")
 def health():
-    """健康检查：docker-compose 和部署脚本都会用到"""
-    return {"status": "ok"}
+    """健康检查：docker-compose 和部署脚本都会用到
+
+    顺带返回缓存统计。把命中率挂在健康检查上，是为了能直接
+    `curl localhost:8000/api/health | jq .cache` 看效果，不用另开监控。
+    """
+    return {
+        "status": "ok",
+        "cache": {
+            "enabled": settings.CACHE_ENABLED,
+            "answer_enabled": settings.CACHE_ANSWER_ENABLED,
+            "retrieval": kb_cache.retrieval_cache.stats.as_dict(),
+            "answer": kb_cache.answer_cache.stats.as_dict(),
+        },
+    }
 
 
 # 托管 AI 生成的前端（构建产物放到 frontend/ 目录下）

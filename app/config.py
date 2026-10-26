@@ -48,5 +48,17 @@ class Settings:
     # 模型没有工具可调，只能基于已有信息给最终答案。
     AGENT_MAX_TOOL_ROUNDS: int = int(os.getenv("AGENT_MAX_TOOL_ROUNDS", "3"))
 
+    # ---------- 缓存（任务3） ----------
+    # 总开关：关掉后所有缓存逻辑直接短路，行为与加缓存前完全一致（可一键回滚）
+    CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").lower() in ("1", "true", "yes")
+    # 检索结果缓存：省掉 embedding + BM25 + Rerank 三次开销
+    CACHE_TTL: int = int(os.getenv("CACHE_TTL", "300"))                # 单条缓存存活秒数
+    CACHE_MAX_ENTRIES: int = int(os.getenv("CACHE_MAX_ENTRIES", "500"))  # 最多缓存多少条（超出按 LRU 淘汰）
+    # 知识库指纹的本地缓存秒数：避免每次检索都查一次 MySQL
+    KB_FINGERPRINT_TTL: int = int(os.getenv("KB_FINGERPRINT_TTL", "10"))
+    # 答案缓存：省掉 LLM 生成。默认关闭——生成带随机性且要"假流式"回放，
+    # 只有在"同一问题被反复问"的场景才划算，交给部署方决定。
+    CACHE_ANSWER_ENABLED: bool = os.getenv("CACHE_ANSWER_ENABLED", "false").lower() in ("1", "true", "yes")
+
 
 settings = Settings()
