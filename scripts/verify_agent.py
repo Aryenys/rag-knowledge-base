@@ -115,7 +115,17 @@ def check_tool_selection() -> int:
 
 
 def check_no_quality_regression() -> bool:
-    """第 2 组：Agent 检索工具 vs 主链路检索，结果必须一致。"""
+    """第 2 组：Agent 检索工具 vs 主链路检索，结果必须一致（等价）。
+
+    判定标准为什么不要求「逐条顺序完全一致」：
+      rerank API 返回的分数存在 ±0.001 级抖动，排名靠后且分数接近的条目
+      顺序会互相翻转。实测主链路自己连跑两次，第 5 条就换过一次。
+      所以拿「顺序完全一致」当标准，主链路自己都过不了，这个标准没有意义。
+
+    有意义的两个判据：
+      1. 首条一致（首条是模型最依赖的那条，必须稳）
+      2. 内容重合度 ≥ 4/5（允许边界条目翻转一格）
+    """
     print("\n" + "=" * 60)
     print("第 2 组：检索质量不降（Agent 路径 vs 主链路路径）")
     print("=" * 60)
@@ -126,37 +136,55 @@ def check_no_quality_regression() -> bool:
 
     query = "RAG 相比纯生成模型有什么优势？"
 
-    # 临时关缓存：两条路都跑真实检索，才能比出"检索逻辑"是否一致
+    # 临时关缓存：三条检索都跑真实链路，才能比出"检索逻辑"是否一致
     old = settings.CACHE_ENABLED
     settings.CACHE_ENABLED = False
     try:
-        # 路径 A：Agent 的检索工具
-        agent_result = run_tool("search_knowledge_base", {"query": query})
-        agent_hits = agent_result["chunks"]
-
-        # 路径 B：主链路（chat_service 用的就是这个）
-        main_hits, _ = retrieval_service.search(query, final_top_k=20)
+        # 对照组：主链路自己连跑两次（用来证明抖动是 rerank 固有的，不是 Agent 引入的）
+        main_a, _ = retrieval_service.search(query, final_top_k=20)
+        main_b, _ = retrieval_service.search(query, final_top_k=20)
+        # 实验组：Agent 的检索工具
+        agent_hits = run_tool("search_knowledge_base", {"query": query})["chunks"]
     finally:
         settings.CACHE_ENABLED = old
 
-    a = [h["content"] for h in agent_hits]
-    b = [h["content"] for h in main_hits]
+    def texts(hits):
+        return [h["content"] for h in hits]
 
-    same_count = len(a) == len(b)
-    same_order = a == b
+    def scores(hits):
+        return [float(h.get("rerank_score") or 0) for h in hits]
+
+    a, b, c = texts(main_a), texts(main_b), texts(agent_hits)
 
     print(f"\n  查询：{query}")
-    print(f"  Agent 路径命中：{len(a)} 条")
-    print(f"  主链路路径命中：{len(b)} 条")
-    print(f"  条数一致：{same_count}    内容与顺序完全一致：{same_order}")
+    print(f"\n  【对照组】主链路连跑两次，看检索本身稳不稳：")
+    print(f"    首次得分：{[round(s, 4) for s in scores(main_a)]}")
+    print(f"    二次得分：{[round(s, 4) for s in scores(main_b)]}")
+    print(f"    完全一致：{a == b}")
+    if a != b:
+        print("    → 主链路自己就不完全一致：rerank 分数有微小抖动，"
+              "排名靠后、分数接近的条目会翻转")
+        print("    → 所以下面不能按「顺序完全一致」判定，否则这一项永远不可能通过")
 
-    if same_order:
-        print("  → 两条路共用 retrieval_service，Agent 模式不引入检索质量回归")
+    overlap = len(set(a) & set(c))
+    top1_same = bool(a) and bool(c) and a[0] == c[0]
+    same_len = len(a) == len(c)
+    ok = top1_same and overlap >= 4 and same_len
+
+    print(f"\n  【实验组】Agent 路径 vs 主链路：")
+    print(f"    命中条数：{len(c)} vs {len(a)}（一致：{same_len}）")
+    print(f"    首条一致：{top1_same}")
+    print(f"    内容重合：{overlap}/{len(a)}")
+    print(f"    Agent 得分：{[round(s, 4) for s in scores(agent_hits)]}")
+
+    if ok:
+        print("  → 两条路共用 retrieval_service.search，Agent 模式不引入检索质量回归")
+        print("  → 残留差异来自 rerank 分数抖动，不是两条路的逻辑差异")
     else:
-        print("  → 不一致！说明两条路的检索逻辑分叉了，需要排查")
+        print("  → 差异超出抖动范围，需要排查两条路的检索逻辑是否分叉")
 
-    print("  结果：PASS" if same_order else "  结果：FAIL")
-    return same_order
+    print(f"  结果：{'PASS' if ok else 'FAIL'}")
+    return ok
 
 
 def check_loop_guard() -> bool:
