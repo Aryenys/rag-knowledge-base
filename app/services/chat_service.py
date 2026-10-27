@@ -8,6 +8,7 @@ import json
 
 from app.cache import kb_cache
 from app.config import settings
+from app.core import prompts
 from app.rag import generator
 from app.services import retrieval_service, session_service
 
@@ -60,10 +61,15 @@ def stream_answer(question: str, session_id: int | None):
         cached = kb_cache.answer_cache.get(answer_key)
         if cached is not None:
             yield _sse({"type": "cache", "layer": "answer", "hit": True})
+            # 版本要跟着缓存走：这条答案是当初那个版本生成的，
+            # 不能因为现在换了默认版本就把功劳记到新版头上
+            used_version = cached.get("prompt_version") or prompts.CURRENT_PROMPT_VERSION
+            yield _sse({"type": "meta", "prompt_version": used_version})
             # 一次性推完整答案：缓存的价值就是快，没必要为了像打字机而人为 sleep 拖慢
             yield _sse({"type": "token", "content": cached["answer"]})
             session_service.save_message(
-                session_id, "assistant", cached["answer"], cached["sources"]
+                session_id, "assistant", cached["answer"], cached["sources"],
+                prompt_version=used_version,
             )
             yield _sse({"type": "sources", "content": cached["sources"]})
             yield _sse({"type": "done"})
@@ -89,13 +95,22 @@ def stream_answer(question: str, session_id: int | None):
     ]
 
     # 7. 落库助手回答（带上引用来源，回看旧会话时能还原引用面板）
-    session_service.save_message(session_id, "assistant", full_answer, sources)
+    # 记下生成这条答案用的 prompt 版本（任务4）：事后要排查"哪版 prompt 把答案变差了"就靠它
+    session_service.save_message(
+        session_id, "assistant", full_answer, sources,
+        prompt_version=prompts.CURRENT_PROMPT_VERSION,
+    )
 
     # 7.5 写答案缓存（引用来源一起存，否则命中时引用面板会是空的）
     if answer_key:
-        kb_cache.answer_cache.set(answer_key, {"answer": full_answer, "sources": sources})
+        kb_cache.answer_cache.set(answer_key, {
+            "answer": full_answer,
+            "sources": sources,
+            "prompt_version": prompts.CURRENT_PROMPT_VERSION,
+        })
 
     # 8. 推引用来源 + 结束帧（前端惯例：回答显示完再展开引用面板）
+    yield _sse({"type": "meta", "prompt_version": prompts.CURRENT_PROMPT_VERSION})
     yield _sse({"type": "sources", "content": sources})
     yield _sse({"type": "done"})
 

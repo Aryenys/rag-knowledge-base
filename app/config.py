@@ -60,5 +60,10 @@ class Settings:
     # 只有在"同一问题被反复问"的场景才划算，交给部署方决定。
     CACHE_ANSWER_ENABLED: bool = os.getenv("CACHE_ANSWER_ENABLED", "false").lower() in ("1", "true", "yes")
 
+    # ---------- Prompt 版本（任务4） ----------
+    # 默认使用的 prompt 版本，对应 app/core/prompt_versions/ 下的 <version>.json。
+    # 取不到或文件损坏时自动回退 v1，不让 prompt 问题拖垮整个服务。
+    PROMPT_VERSION: str = os.getenv("PROMPT_VERSION", "v1")
+
 
 settings = Settings()

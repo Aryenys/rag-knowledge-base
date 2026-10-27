@@ -3,62 +3,39 @@
 面试高频问题："你的 prompt 是怎么设计的？" —— 答案就在这个文件里。
 设计要点：① 限定只根据资料回答（抑制幻觉）② 强制标注引用编号（可溯源）
          ③ 明确"不知道"的兜底话术 ④ 输出格式约束（分点、简洁）
+
+【任务4 改造】
+模板内容已迁到 prompt_versions/*.json，这里只做两件事：
+  1. 把默认版本的模板暴露成同名常量——调用方（含 app/rag/generator.py）一行都不用改
+  2. 保留 build_context / format_history 两个拼装函数
+
+这样做的收益：切 PROMPT_VERSION 环境变量就能换整套 prompt，
+而 app/rag/ 下的生成代码完全没动，默认版本（v1）的模板与改造前逐字一致。
 """
+from app.core import prompt_registry
+
+# ---------- 当前生效版本 ----------
+# 注意：这里在模块加载时求值一次，所以改 PROMPT_VERSION 需要重启服务。
+# 这是刻意的取舍——prompt 属于发布配置，不该在运行时被随便改，
+# 否则线上会出现"同一个问题前后答案风格不一致"的诡异现象。
+CURRENT_PROMPT_VERSION = prompt_registry.current_version()
 
 # ---------- 主问答 Prompt ----------
-RAG_SYSTEM_PROMPT = """你是企业知识库助手。请仅根据以下【参考资料】回答用户问题。
-
-要求：
-1. 回答中引用资料时，在句末标注来源编号，如 [1]、[2]
-2. 如果【参考资料】不足以回答问题，明确回复"根据现有资料无法回答该问题"，不要编造内容
-3. 回答简洁、有条理，必要时分点列出
-
-【参考资料】
-{context}"""
+RAG_SYSTEM_PROMPT = prompt_registry.get_template("rag_system")
 
 # 单条参考资料的格式（context 由多条拼接而成）
-CONTEXT_ITEM_TEMPLATE = "[{index}] (来源: {filename}{page_info})\n{content}"
+CONTEXT_ITEM_TEMPLATE = prompt_registry.get_template("context_item")
 
 # ---------- 查询改写 Prompt（解决多轮对话中的指代问题："它"、"这个"） ----------
-QUERY_REWRITE_PROMPT = """根据以下对话历史，把用户的最新问题改写成一个独立、完整、无需上下文即可理解的问题。
-只输出改写后的问题本身，不要输出任何其他内容。如果问题本身已经完整独立，原样输出即可。
-
-【对话历史】
-{history}
-
-【最新问题】
-{question}
-
-改写后的问题："""
-
+QUERY_REWRITE_PROMPT = prompt_registry.get_template("query_rewrite")
 
 # ---------- 无检索结果兜底 Prompt（相似度过滤后 chunks 为空时用） ----------
-NO_CONTEXT_SYSTEM_PROMPT = """你是企业知识库助手。当前知识库中没有检索到与用户问题相关的内容。
-如果用户是在闲聊（打招呼、问候等），请友好、简短地回应。
-如果用户在提问知识性问题，请明确告知"知识库中未找到相关内容"，并建议用户换一种问法或确认相关文档是否已上传。
-不要编造知识库中不存在的内容。"""
-
+NO_CONTEXT_SYSTEM_PROMPT = prompt_registry.get_template("no_context")
 
 # ---------- Agent 决策层 Prompt（任务1） ----------
 # 与普通 RAG prompt 的区别：这里不再预先塞参考资料，
 # 而是告诉模型"你有哪些工具、什么时候该用哪个"，把检索的决定权交给模型
-AGENT_SYSTEM_PROMPT = """你是企业知识库助手，可以使用以下两个工具获取信息：
-1. search_knowledge_base(query)：检索知识库正文，返回相关文档片段
-2. get_knowledge_base_stats()：查看知识库的文档数量、切片数量、文件清单
-
-工具选择规则（先判断，再动手）：
-- 只要答案需要知识库文档里的**具体内容**（某文档讲了什么、某概念是什么、某操作怎么做），
-  一律调用 search_knowledge_base。即使问题看起来是通用常识（如"RAG 是什么"），也要先检索。
-- 只有当用户**只想知道数量或文件清单**（如"有几份文档""装了哪些文件"）、
-  完全不关心文档正文内容时，才调用 get_knowledge_base_stats。
-- 拿不准时优先用 search_knowledge_base：多检索一次的代价，远小于答错。
-
-工作原则：
-1. 闲聊、打招呼、跟知识库无关的闲聊：直接回答，不要调用任何工具
-2. 一次检索没找到答案时，可以换个角度改写 query 再检索一次；仍没有就如实说明，不要编造
-3. 回答中引用资料时，在句末标注来源编号，如 [1]、[2]
-4. 工具返回的信息不足以回答时，明确告知"根据现有资料无法回答该问题"
-"""
+AGENT_SYSTEM_PROMPT = prompt_registry.get_template("agent_system")
 
 
 def build_context(chunks: list[dict]) -> str:

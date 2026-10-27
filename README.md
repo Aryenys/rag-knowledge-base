@@ -16,6 +16,7 @@
 - [Agent 模式（工具调用）](#agent-模式工具调用)
 - [MCP Server（对外暴露工具）](#mcp-server对外暴露工具)
 - [缓存设计](#缓存设计)
+- [Prompt 版本管理](#prompt-版本管理)
 - [检索效果对比](#检索效果对比)
 - [技术栈与选型理由](#技术栈与选型理由)
 - [项目结构](#项目结构)
@@ -41,6 +42,7 @@
 | **Agent 模式** | 模型自主决定「直接回答 / 调检索工具 / 调统计工具」，支持多轮工具调用，前端实时展示工具调用过程 |
 | **MCP Server** | 同一套工具以 MCP 协议对外暴露，Claude Desktop / Cursor 等任意 MCP 客户端可直接查询本知识库 |
 | **分层缓存** | 检索结果缓存（默认开）+ 答案缓存（默认关），LRU + TTL 双淘汰，知识库一变自动失效 |
+| **Prompt 版本管理** | 提示词带版本号存于 Git，`extends` 继承只写差异，版本随答案落库可回溯，配错自动回退 |
 | **引用溯源** | 每条回答附带引用片段（文件名 + 页码 + 原文截取），点击可定位到原文位置 |
 | **会话持久化** | MySQL 存储会话/消息/文档元数据，外键级联删除 |
 | **评估体系** | LLM 自动合成评测集 + Recall@5 / MRR 双指标，可复跑验证任何检索改动 |
@@ -421,6 +423,105 @@ curl localhost:8000/api/health | jq .cache
 
 ---
 
+## Prompt 版本管理
+
+### 为什么要版本化
+
+三个改 prompt 时必然遇到的痛点：
+
+1. **改完就覆盖，无从回溯**——线上答案变差了，不知道是哪次改动引起的，只能翻 Git log 猜
+2. **没法灰度、没法快速回滚**——想试新 prompt 只能改代码重启，试错了再改回去
+3. **改好改坏只能凭感觉**——检索指标（Recall/MRR）对 prompt 完全不敏感，帮不上忙
+
+对应做法：模板抽成带版本的配置文件 → 版本号随答案落库 → 提供对比脚本。
+
+### 目录结构
+
+```
+app/core/prompt_versions/
+├── v1.json    # 基线版本：从改造前的 prompts.py 原样迁出，逐字未改
+└── v2.json    # extends v1，只写「跟 v1 不一样的那一个模板」
+```
+
+版本之间用 `extends` 继承：v2 只覆盖主问答 prompt，其余四个模板自动沿用 v1，
+不用复制粘贴整份模板。改 prompt 从此只改一处差异。
+
+### 怎么加一个新版本
+
+新建 `app/core/prompt_versions/v3.json`：
+
+```json
+{
+  "version": "v3",
+  "name": "这次改了什么",
+  "extends": "v2",
+  "changes": ["逐条列出变更，方便日后回溯"],
+  "templates": { "rag_system": "…只写需要改的那个模板…" }
+}
+```
+
+模板里允许的变量只有 `context / history / question / index / filename / page_info / content`，
+**加载时就会校验**，写错占位符立刻报错，不会等到线上某次问答才 KeyError。
+
+### 怎么切换和回滚
+
+```bash
+PROMPT_VERSION=v2 uvicorn app.main:app     # 切到 v2
+PROMPT_VERSION=v1 uvicorn app.main:app     # 回滚，改一个环境变量即可
+```
+
+配错版本号（或 JSON 写坏）时自动回退 v1 并告警，不让 prompt 问题拖垮整个服务。
+
+### 每次回答都记了版本
+
+`chat_messages` 表有 `prompt_version` 列，每条 assistant 消息都记下生成时用的版本：
+
+```sql
+SELECT role, prompt_version, created_at FROM chat_messages WHERE role='assistant';
+```
+
+前端也会在回答上方显示 `prompt v1` 徽标。于是"这条答案答得不好"可以精确归因到某个版本。
+
+> 老库升级：`init_db()` 里带幂等的 `ALTER TABLE`，服务重启自动补列，不需要手工迁移。
+> 也可以用 `python -c "from app.core.database import ensure_prompt_version_column; ensure_prompt_version_column()"` 单独执行。
+
+### 改好还是改差，怎么判断
+
+检索指标衡量不了生成质量，所以对比脚本做的是**控制变量 + 人工判断**：
+同一批检索结果喂给两个版本，唯一变量是 prompt。
+
+```bash
+python -m scripts.compare_prompts --n 3        # 对比 v1 vs v2
+```
+
+实测（2 条问题，样本小，仅作示例）：
+
+| 版本 | 平均长度 | 平均引用标注 |
+| :--- | ---: | ---: |
+| v1 | 108 字 | 1.5 处 |
+| v2 | 147 字 | **4.5 处** |
+
+v2 要求"每个关键结论后都标注来源"，标注密度从 1.5 涨到 4.5，说明改动确实生效了。
+但标注变多**不等于质量更好**——可能是溯源更细，也可能是啰嗦，最终要人来看答案。
+
+### 三个设计取舍
+
+| 取舍 | 选择 | 理由 |
+| :--- | :--- | :--- |
+| 存哪里 | 文件（Git）而非数据库 | prompt 要跟代码一起评审、一起 diff；放数据库等于放进了最难审计的地方 |
+| 何时加载 | 启动时加载，改版本要重启 | prompt 属于发布配置。允许运行时热改，会出现"同一问题前后风格不一致" |
+| 默认行为 | v1 与改造前逐字一致 | `app/rag/` 下的生成代码一行没动，只是模板搬了家 |
+
+### 代码位置
+
+```
+app/core/prompt_registry.py        # 版本加载 / extends 继承 / 占位符校验 / 安全渲染
+app/core/prompt_versions/*.json    # 版本文件
+app/core/prompts.py                # 兼容层：把默认版本暴露成同名常量
+```
+
+---
+
 ## 检索效果对比
 
 评测集：由 LLM 从真实文档切片自动合成的 **92 条**问答对（`data/eval_set.json`），
@@ -496,7 +597,9 @@ rag-knowledge-base/
 │   │   ├── database.py            # 引擎、SessionLocal、init_db
 │   │   ├── logging.py             # RotatingFileHandler + 第三方库降噪
 │   │   ├── time_utils.py          # utc_now() / ensure_utc()，统一时间基准
-│   │   └── prompts.py             # 提示词集中管理
+│   │   ├── prompts.py             # 提示词兼容层：把默认版本暴露成同名常量
+│   │   ├── prompt_registry.py     # 版本加载 / extends 继承 / 占位符校验
+│   │   └── prompt_versions/       # v1.json（基线）、v2.json（extends v1）
 │   ├── models/
 │   │   ├── db_models.py           # ORM 模型：documents / chat_sessions / chat_messages
 │   │   └── schemas.py             # Pydantic 请求响应模型
@@ -534,7 +637,9 @@ rag-knowledge-base/
 │   ├── check_time.py              # 时间链路自检（验证存储确为 UTC）
 │   ├── check_vector.py            # 向量库 / MySQL / 磁盘 三处数据一致性对账
 │   ├── bench_cache.py             # 缓存压测：冷/热两轮对比，出命中率与加速比
-│   └── verify_agent.py            # Agent 验证：工具选择 / 防死循环闸门 / 检索不降质
+│   ├── verify_agent.py            # Agent 验证：工具选择 / 防死循环闸门 / 检索不降质
+│   ├── verify_prompts.py          # Prompt 版本验证：含「默认版本逐字一致」回归锚点
+│   └── compare_prompts.py         # 两个 prompt 版本的答案对比（控制变量，只差 prompt）
 │   ├── check_db.py                # 数据库表内容速览
 │   ├── fix_legacy_time.py         # 历史时间偏移订正（带 dry-run）
 │   ├── init_mysql.py              # 建库
@@ -616,6 +721,8 @@ uvicorn app.main:app --reload --port 8000
 | 同上（省额度版） | `python -m scripts.verify_agent --quick` | 只跑"检索质量不降"，不调 LLM |
 | MCP Server 能不能被客户端用 | `python -m tests.test_mcp_server` | 握手成功 + 发现 2 个工具 + 两次调用都返回数据 |
 | 缓存到底省了多少 | `python -m scripts.bench_cache --n 10` | 第 2 轮命中率 100%、平均延迟降到 1ms 以内 |
+| Prompt 版本机制正常 | `python -m scripts.verify_prompts` | 6 组全 PASS，其中「默认版本与改造前逐字一致」是回归锚点 |
+| 两个版本的答案差异 | `python -m scripts.compare_prompts --n 3` | 同一批检索结果下并排输出，看引用密度等指标变化 |
 | 缓存（对照组） | `python -m scripts.bench_cache --n 10 --no-cache` | 两轮耗时接近，用来反证上面的差距确实来自缓存 |
 | 检索质量有没有退步 | `python -m tests.evaluate` | Recall@5 / MRR 与历史基线一致（92 条，约 13 分钟） |
 
@@ -653,6 +760,7 @@ curl http://127.0.0.1:8000/api/health   # 顺便返回缓存实时命中率
 | `HISTORY_TURNS` | `5` | 多轮对话携带的历史轮数 |
 | `AGENT_MAX_TOOL_ROUNDS` | `3` | Agent 模式最大工具调用轮数（防死循环硬闸门） |
 | `MCP_TRANSPORT` | `stdio` | MCP Server 传输方式，客户端直连时用 stdio |
+| `PROMPT_VERSION` | `v1` | 默认使用的 prompt 版本，对应 `app/core/prompt_versions/<version>.json` |
 | `CACHE_ENABLED` | `true` | 缓存总开关，关掉后行为与加缓存前完全一致（可一键回滚） |
 | `CACHE_TTL` | `300` | 单条缓存存活秒数 |
 | `CACHE_MAX_ENTRIES` | `500` | 缓存最多存多少条，超出按 LRU 淘汰 |
@@ -703,9 +811,17 @@ data: {"type": "session", "id": 1}
 
 data: {"type": "token",   "content": "回答的一个片段"}
 
+data: {"type": "meta",     "prompt_version": "v1"}
+
 data: {"type": "sources", "content": [{"index":1,"filename":"xx.pdf","page":3,"score":0.87,...}]}
 
 data: {"type": "done"}
+```
+
+缓存命中时还会在最前面多一帧，前端据此显示徽标：
+
+```
+data: {"type": "cache", "layer": "retrieval", "hit": true}
 ```
 
 Agent 模式（`agent=true`）在上述基础上**多两种帧**，用于展示工具调用过程：
@@ -717,6 +833,7 @@ data: {"type": "tool_result", "name": "search_knowledge_base", "summary": "检�
 ```
 
 前端依次处理：`session` 记录会话 id → `tool` / `tool_result` 渲染工具调用过程 →
+`meta` 显示 prompt 版本徽标 →
 `token` 追加渲染 → `sources` 渲染引用面板 → `done` 结束加载态。
 
 命中缓存时还会**多一种帧**（在 token 之前到达，前端据此显示"⚡ 缓存命中"徽标）：
@@ -892,7 +1009,7 @@ netstat -ano | findstr ":3306"
 - [x] **MCP Server 封装**：`mcp_server/` 已把 Agent 工具封装成 MCP Server，Claude Desktop / Cursor 可直接调用本知识库
 - [x] **缓存层**：检索结果缓存（默认开）+ 答案缓存（默认关），LRU+TTL 双淘汰，知识库指纹自动失效，含压测脚本
 - [ ] **相似 query 缓存匹配**：当前是精确匹配，语义相似匹配需要向量近邻检索，性价比待评估
-- [ ] **Prompt 版本管理**：提示词抽成带版本号的配置文件，评测脚本支持按版本跑回归对比
+- [x] **Prompt 版本管理**：提示词抽成带版本号的 JSON（`extends` 继承，只写差异），版本号随答案落库可回溯，配错自动回退 v1，含对比脚本
 - [ ] **结构化输出**：用 JSON Schema 约束模型输出（答案正文 + 引用列表），前端按结构化结果渲染
 
 ---

@@ -48,5 +48,8 @@ class ChatMessage(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     sources: Mapped[list | None] = mapped_column(JSON, nullable=True)  # assistant 消息的引用来源
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    # 生成这条回答时用的 prompt 版本（任务4）。user 消息为 NULL。
+    # 有了它才能回答"这条答得不好，是哪个版本的 prompt 生成的"。
+    prompt_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     session: Mapped["ChatSession"] = relationship(back_populates="messages")

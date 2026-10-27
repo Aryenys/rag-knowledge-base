@@ -41,6 +41,8 @@ def _message_to_dict(m: ChatMessage) -> dict:
         "content": m.content,
         "sources": m.sources,  # JSON 列：None（user）或引用来源列表（assistant）
         "created_at": ensure_utc(m.created_at),
+        # 可能为 None：一是 user 消息不记版本，二是该列是任务4 新加的、老数据没有值
+        "prompt_version": getattr(m, "prompt_version", None),
     }
 
 
@@ -116,8 +118,18 @@ def delete_session(session_id: int) -> bool:
 
 # ---------- 消息 ----------
 
-def save_message(session_id: int, role: str, content: str, sources: list | None = None) -> dict:
-    """落库一条消息。role=user 或 assistant；sources 仅 assistant 携带引用来源"""
+def save_message(
+    session_id: int,
+    role: str,
+    content: str,
+    sources: list | None = None,
+    prompt_version: str | None = None,
+) -> dict:
+    """落库一条消息。role=user 或 assistant；sources 仅 assistant 携带引用来源。
+
+    prompt_version（任务4）：只给 assistant 消息写，记下这条答案是用哪个
+    prompt 版本生成的。留 None 也能用，所以老调用方不受影响。
+    """
     db: Session = SessionLocal()
     try:
         msg = ChatMessage(
@@ -126,6 +138,7 @@ def save_message(session_id: int, role: str, content: str, sources: list | None 
             content=content,
             sources=sources,
             created_at=utc_now(),
+            prompt_version=prompt_version,
         )
         db.add(msg)
         db.commit()

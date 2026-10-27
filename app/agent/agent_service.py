@@ -157,7 +157,11 @@ def stream_agent_answer(question: str, session_id: int | None):
     ]
 
     # 4. 落库 + 推引用 + 结束帧
-    session_service.save_message(session_id, "assistant", full_answer, sources)
+    session_service.save_message(
+        session_id, "assistant", full_answer, sources,
+        prompt_version=prompts.CURRENT_PROMPT_VERSION,
+    )
+    yield _sse({"type": "meta", "prompt_version": prompts.CURRENT_PROMPT_VERSION})
     yield _sse({"type": "sources", "content": sources})
     yield _sse({"type": "done"})
 
