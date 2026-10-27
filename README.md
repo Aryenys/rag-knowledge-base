@@ -20,6 +20,7 @@
 - [技术栈与选型理由](#技术栈与选型理由)
 - [项目结构](#项目结构)
 - [快速开始](#快速开始)
+- [如何验证](#如何验证)
 - [环境变量](#环境变量)
 - [API 文档](#api-文档)
 - [工程实践](#工程实践)
@@ -532,7 +533,8 @@ rag-knowledge-base/
 │   ├── build_eval_set.py          # LLM 合成评测集
 │   ├── check_time.py              # 时间链路自检（验证存储确为 UTC）
 │   ├── check_vector.py            # 向量库 / MySQL / 磁盘 三处数据一致性对账
-│   └── bench_cache.py             # 缓存压测：冷/热两轮对比，出命中率与加速比
+│   ├── bench_cache.py             # 缓存压测：冷/热两轮对比，出命中率与加速比
+│   └── verify_agent.py            # Agent 验证：工具选择 / 防死循环闸门 / 检索不降质
 │   ├── check_db.py                # 数据库表内容速览
 │   ├── fix_legacy_time.py         # 历史时间偏移订正（带 dry-run）
 │   ├── init_mysql.py              # 建库
@@ -601,6 +603,28 @@ uvicorn app.main:app --reload --port 8000
 应用启动时会自动建表（`init_db()` 幂等，已有表不会被覆盖）。
 
 > ⚠️ 本机已装 MySQL 的话注意端口：compose 把容器 MySQL 映射到宿主机 **3307**，避免和本机 3306 冲突。
+
+---
+
+## 如何验证
+
+每个能力都配了可复现的验证入口，不用靠肉眼判断「好像变快了」。
+
+| 想验证什么 | 命令 | 通过标准 |
+| :--- | :--- | :--- |
+| Agent 会不会选工具 | `python -m scripts.verify_agent` | 工具选择 4/4；闸门轮数卡在 3；两条检索路径结果一致 |
+| 同上（省额度版） | `python -m scripts.verify_agent --quick` | 只跑"检索质量不降"，不调 LLM |
+| MCP Server 能不能被客户端用 | `python -m tests.test_mcp_server` | 握手成功 + 发现 2 个工具 + 两次调用都返回数据 |
+| 缓存到底省了多少 | `python -m scripts.bench_cache --n 10` | 第 2 轮命中率 100%、平均延迟降到 1ms 以内 |
+| 缓存（对照组） | `python -m scripts.bench_cache --n 10 --no-cache` | 两轮耗时接近，用来反证上面的差距确实来自缓存 |
+| 检索质量有没有退步 | `python -m tests.evaluate` | Recall@5 / MRR 与历史基线一致（92 条，约 13 分钟） |
+
+浏览器里也能直接看到：勾上「Agent 模式」后，回答上方会出现工具调用过程面板；
+命中缓存时回答下方会显示「缓存命中」徽标。
+
+```bash
+curl http://127.0.0.1:8000/api/health   # 顺便返回缓存实时命中率
+```
 
 ---
 
