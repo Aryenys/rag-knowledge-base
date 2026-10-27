@@ -17,6 +17,7 @@
 - [MCP Server（对外暴露工具）](#mcp-server对外暴露工具)
 - [缓存设计](#缓存设计)
 - [Prompt 版本管理](#prompt-版本管理)
+- [结构化输出](#结构化输出)
 - [检索效果对比](#检索效果对比)
 - [技术栈与选型理由](#技术栈与选型理由)
 - [项目结构](#项目结构)
@@ -43,6 +44,7 @@
 | **MCP Server** | 同一套工具以 MCP 协议对外暴露，Claude Desktop / Cursor 等任意 MCP 客户端可直接查询本知识库 |
 | **分层缓存** | 检索结果缓存（默认开）+ 答案缓存（默认关），LRU + TTL 双淘汰，知识库一变自动失效 |
 | **Prompt 版本管理** | 提示词带版本号存于 Git，`extends` 继承只写差异，版本随答案落库可回溯，配错自动回退 |
+| **结构化输出** | 按 JSON Schema 返回答案正文 + 引用编号 + 把握度 + 是否拒答；引用编号越界（幻觉）可机器剔除，解析失败自动修复并降级 |
 | **引用溯源** | 每条回答附带引用片段（文件名 + 页码 + 原文截取），点击可定位到原文位置 |
 | **会话持久化** | MySQL 存储会话/消息/文档元数据，外键级联删除 |
 | **评估体系** | LLM 自动合成评测集 + Recall@5 / MRR 双指标，可复跑验证任何检索改动 |
@@ -522,6 +524,70 @@ app/core/prompts.py                # 兼容层：把默认版本暴露成同名�
 
 ---
 
+## 结构化输出
+
+默认模式返回的是一整段 Markdown 文本，下游拿不到机器可读的信息。**结构化模式**
+（请求参数 `structured: true`）让模型按固定 JSON Schema 回答：
+
+```json
+{
+  "answer": "RAG 在开放域问答上取得了当时的最优结果……[1][2]",
+  "citations": [1, 2, 3],
+  "confidence": "high",
+  "answered": true,
+  "refuse_reason": null
+}
+```
+
+### 解决了什么普通模式解决不了的事
+
+| 字段 | 普通模式的困境 | 结构化后可判定 |
+| :--- | :--- | :--- |
+| `citations` | 引用了哪几条只能从正文正则抠 `[1][2]`，漏标、标错编号机器发现不了 | **引用编号越界 = 幻觉**，机器能直接剔除（只给了 5 条，模型编了个 `[9]`） |
+| `answered` | 资料不足时模型"礼貌拒答"，文本上和正常回答混在一起 | 拒答变成**可统计的指标**，能算出拒答率 |
+| `confidence` | 无从得知模型把握程度 | `low` 可作为"建议人工复核"的触发条件 |
+
+另外前端也能据此区分「检索到了但没用」和「真的被引用了」——引用面板里被点名的
+那几条会标上「✓ 回答中已引用」。
+
+### 与流式的取舍（最关键的一点）
+
+**JSON 必须完整才合法，所以结构化模式下无法逐 token 吐字**——这是协议层面的互斥，
+不是实现偷懒。所以做成按请求开关，两者由调用方按场景选：
+
+| | `structured: false`（默认） | `structured: true` |
+| :--- | :--- | :--- |
+| 帧类型 | 多个 `token` 帧（打字机） | 单个 `structured` 帧（一次性） |
+| 适用 | 人机对话，体验优先 | 程序化调用、评测、需要引用校验 |
+
+> ⚠️ `agent: true` 与 `structured: true` 同时传时**以 agent 优先**：
+> Agent 用的是工具调用协议，本身就是结构化的，再套一层 JSON Schema 只会限制它调工具。
+
+### 模型输出不稳定是常态，所以解析必须"宽松进、严格出"
+
+`parse_structured()` 会依次处理：剥离 ` ```json ` 围栏 → 截取最外层 `{...}`（模型爱加客套话）
+→ 补齐漏掉的字段 → 把 `"2"` / `2` 归一成 `[2]` → **剔除越界编号** → 枚举值归一 → Pydantic 严格校验。
+全部失败才降级成纯文本（`parse_ok=false`），**绝不抛异常打挂请求**。
+
+解析失败时还会带着错误原因让模型**自己改一次**（`temperature=0`），比直接降级更有用，
+只多花一次调用。
+
+### 格式契约为什么不放在 prompt 版本文件里
+
+版本文件的占位符走白名单校验，而 JSON Schema 本身就是满屏花括号，会被当成未知占位符拒绝加载。
+更本质的原因：prompt 版本管的是**回答风格**，输出格式是**接口契约**，两者正交——
+换 prompt 版本不应该影响结构化字段。所以格式契约放在代码里，由 `StructuredAnswer` 直接生成，
+字段改了提示词自动跟着变，不会漂移。
+
+### 代码位置
+
+```
+app/models/schemas.py              # StructuredAnswer 契约（schema 由它生成）
+app/services/structured_service.py # 格式指令 / json_object 调用 / 解析修复 / 降级
+```
+
+---
+
 ## 检索效果对比
 
 评测集：由 LLM 从真实文档切片自动合成的 **92 条**问答对（`data/eval_set.json`），
@@ -620,7 +686,8 @@ rag-knowledge-base/
 │       ├── session_service.py     # 会话 DAO（含事务边界）
 │       ├── retrieval_service.py   # 检索编排（召回+过滤+精排），缓存挂在这里
 │       ├── document_service.py    # 入库业务编排
-│       └── document_repository.py # 文档元数据 DAO
+│       ├── document_repository.py # 文档元数据 DAO
+│       └── structured_service.py  # 结构化输出：格式指令 / 解析修复 / 降级
 ├── frontend/index.html            # 单文件前端（会话侧边栏 + 流式渲染 + 引用面板）
 ├── mcp_server/
 │   ├── __init__.py                # 包说明：与 app/agent 的分工
@@ -639,7 +706,8 @@ rag-knowledge-base/
 │   ├── bench_cache.py             # 缓存压测：冷/热两轮对比，出命中率与加速比
 │   ├── verify_agent.py            # Agent 验证：工具选择 / 防死循环闸门 / 检索不降质
 │   ├── verify_prompts.py          # Prompt 版本验证：含「默认版本逐字一致」回归锚点
-│   └── compare_prompts.py         # 两个 prompt 版本的答案对比（控制变量，只差 prompt）
+│   ├── compare_prompts.py         # 两个 prompt 版本的答案对比（控制变量，只差 prompt）
+│   ├── verify_structured.py       # 结构化输出验证：11 个解析用例 + 3 次真实调用
 │   ├── check_db.py                # 数据库表内容速览
 │   ├── fix_legacy_time.py         # 历史时间偏移订正（带 dry-run）
 │   ├── init_mysql.py              # 建库
@@ -723,11 +791,14 @@ uvicorn app.main:app --reload --port 8000
 | 缓存到底省了多少 | `python -m scripts.bench_cache --n 10` | 第 2 轮命中率 100%、平均延迟降到 1ms 以内 |
 | Prompt 版本机制正常 | `python -m scripts.verify_prompts` | 6 组全 PASS，其中「默认版本与改造前逐字一致」是回归锚点 |
 | 两个版本的答案差异 | `python -m scripts.compare_prompts --n 3` | 同一批检索结果下并排输出，看引用密度等指标变化 |
+| 结构化输出解析够不够健壮 | `python -m scripts.verify_structured` | 5 组全 PASS，含 11 个解析用例与 3 次真实调用 |
+| 同上（省额度版） | `python -m scripts.verify_structured --quick` | 只跑解析用例与 schema 一致性，不调 LLM |
 | 缓存（对照组） | `python -m scripts.bench_cache --n 10 --no-cache` | 两轮耗时接近，用来反证上面的差距确实来自缓存 |
 | 检索质量有没有退步 | `python -m tests.evaluate` | Recall@5 / MRR 与历史基线一致（92 条，约 13 分钟） |
 
 浏览器里也能直接看到：勾上「Agent 模式」后，回答上方会出现工具调用过程面板；
-命中缓存时回答下方会显示「缓存命中」徽标。
+命中缓存时回答下方会显示「缓存命中」徽标；勾上「结构化输出」后会显示把握度、
+实际引用编号，引用面板里被真正引用的那几条会标上「✓ 回答中已引用」。
 
 ```bash
 curl http://127.0.0.1:8000/api/health   # 顺便返回缓存实时命中率
@@ -801,6 +872,7 @@ curl http://127.0.0.1:8000/api/health   # 顺便返回缓存实时命中率
 | `question` | string | 必填 | 用户问题 |
 | `session_id` | int \| null | null | 为空表示新建会话，首帧返回新 id |
 | `agent` | bool | **false** | 是否启用 Agent 模式（模型自主决定是否调用工具） |
+| `structured` | bool | **false** | 是否按 JSON Schema 返回（`agent=true` 时本项不生效） |
 
 ### SSE 帧格式约定
 
@@ -832,9 +904,15 @@ data: {"type": "tool",        "name": "search_knowledge_base", "arguments": {"qu
 data: {"type": "tool_result", "name": "search_knowledge_base", "summary": "检索「RAG」：命中 5 条片段", "round": 1}
 ```
 
+结构化模式（`structured=true`）**不发 `token` 帧**，改成一次性发一帧：
+
+```
+data: {"type": "structured", "content": {"answer":"...","citations":[1,2],"confidence":"high","answered":true,"refuse_reason":null,"parse_ok":true,"warnings":[]}}
+```
+
 前端依次处理：`session` 记录会话 id → `tool` / `tool_result` 渲染工具调用过程 →
 `meta` 显示 prompt 版本徽标 →
-`token` 追加渲染 → `sources` 渲染引用面板 → `done` 结束加载态。
+`token` 追加渲染（或 `structured` 一次性渲染）→ `sources` 渲染引用面板 → `done` 结束加载态。
 
 命中缓存时还会**多一种帧**（在 token 之前到达，前端据此显示"⚡ 缓存命中"徽标）：
 
@@ -1010,7 +1088,9 @@ netstat -ano | findstr ":3306"
 - [x] **缓存层**：检索结果缓存（默认开）+ 答案缓存（默认关），LRU+TTL 双淘汰，知识库指纹自动失效，含压测脚本
 - [ ] **相似 query 缓存匹配**：当前是精确匹配，语义相似匹配需要向量近邻检索，性价比待评估
 - [x] **Prompt 版本管理**：提示词抽成带版本号的 JSON（`extends` 继承，只写差异），版本号随答案落库可回溯，配错自动回退 v1，含对比脚本
-- [ ] **结构化输出**：用 JSON Schema 约束模型输出（答案正文 + 引用列表），前端按结构化结果渲染
+- [x] **结构化输出**：用 JSON Schema 约束模型输出（答案正文 + 引用列表 + 把握度 + 是否拒答），前端按结构化结果渲染
+- [ ] **结构化输出的流式折中**：流式输出 `answer` 字段、结束时再补元数据帧，兼顾体验与可机读
+- [ ] **拒答率 / 引用准确率看板**：结构化字段已落库后，按 prompt 版本聚合这两个指标
 
 ---
 

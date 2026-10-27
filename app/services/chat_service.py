@@ -10,10 +10,15 @@ from app.cache import kb_cache
 from app.config import settings
 from app.core import prompts
 from app.rag import generator
-from app.services import retrieval_service, session_service
+from app.services import retrieval_service, session_service, structured_service
 
 
-def stream_answer(question: str, session_id: int | None):
+def stream_answer(question: str, session_id: int | None, structured: bool = False):
+    """SSE 生成器：逐 token yield f"data: {json}\n\n" 格式的帧。
+
+    structured=True 时不再逐 token 推送，改成一次性推一帧 structured：
+    JSON 必须完整才合法，与流式天然互斥（详见 structured_service 模块说明）。
+    """
     """SSE 生成器：逐 token yield f"data: {json}\\n\\n" 格式的帧。"""
     # 0. 【W4】会话归属：前端没传 id 就新建一个（首次提问 / 点了"新对话"）
     if session_id is None:
@@ -55,7 +60,11 @@ def stream_answer(question: str, session_id: int | None):
     #        不是真的流式。只在"同一问题被反复问"的场景才划算，交给部署方决定。
     answer_key = None
     if settings.CACHE_ENABLED and settings.CACHE_ANSWER_ENABLED and not history:
-        answer_key = kb_cache.make_key(question, scope="answer")
+        # 结构化与否用不同的 scope：普通答案只有 answer 字段，结构化的还有 citations 等，
+        # 混在一个 key 里会出现"要结构化却拿到纯文本"的错配
+        answer_key = kb_cache.make_key(
+            question, scope="answer_structured" if structured else "answer"
+        )
 
     if answer_key:
         cached = kb_cache.answer_cache.get(answer_key)
@@ -65,21 +74,37 @@ def stream_answer(question: str, session_id: int | None):
             # 不能因为现在换了默认版本就把功劳记到新版头上
             used_version = cached.get("prompt_version") or prompts.CURRENT_PROMPT_VERSION
             yield _sse({"type": "meta", "prompt_version": used_version})
-            # 一次性推完整答案：缓存的价值就是快，没必要为了像打字机而人为 sleep 拖慢
-            yield _sse({"type": "token", "content": cached["answer"]})
+            # 缓存里没存过结构化结果（比如普通模式下写的缓存）就退回纯文本回放
+            payload = cached.get("structured") if structured else None
+            if payload:
+                text = payload.get("answer", "")
+                yield _sse({"type": "structured", "content": payload})
+            else:
+                text = cached["answer"]
+                # 一次性推完整答案：缓存的价值就是快，没必要为了像打字机而人为 sleep 拖慢
+                yield _sse({"type": "token", "content": text})
             session_service.save_message(
-                session_id, "assistant", cached["answer"], cached["sources"],
+                session_id, "assistant", text, cached["sources"],
                 prompt_version=used_version,
             )
             yield _sse({"type": "sources", "content": cached["sources"]})
             yield _sse({"type": "done"})
             return
 
-    # 5. 流式生成：边收 token 边推帧给前端（生成用原始问题 + 历史）
+    # 5. 生成（生成用原始问题 + 历史）
     full_answer = ""
-    for token in generator.stream_generate(question, hits, history=history):
-        full_answer += token  # 攒完整回答，生成结束后落库
-        yield _sse({"type": "token", "content": token})
+    structured_payload = None
+    if structured:
+        # 【任务5】结构化模式：一次性拿完整 JSON，推一帧给前端
+        result = structured_service.generate_structured(question, hits, history)
+        structured_payload = result["data"]
+        full_answer = structured_payload.get("answer", "")
+        yield _sse({"type": "structured", "content": structured_payload})
+    else:
+        # 普通模式：边收 token 边推帧给前端（打字机体验）
+        for token in generator.stream_generate(question, hits, history=history):
+            full_answer += token  # 攒完整回答，生成结束后落库
+            yield _sse({"type": "token", "content": token})
 
     # 6. 组装引用来源（落库和推给前端共用同一份，保证两边显示一致）
     sources = [
@@ -103,11 +128,14 @@ def stream_answer(question: str, session_id: int | None):
 
     # 7.5 写答案缓存（引用来源一起存，否则命中时引用面板会是空的）
     if answer_key:
-        kb_cache.answer_cache.set(answer_key, {
+        entry = {
             "answer": full_answer,
             "sources": sources,
             "prompt_version": prompts.CURRENT_PROMPT_VERSION,
-        })
+        }
+        if structured_payload is not None:
+            entry["structured"] = structured_payload
+        kb_cache.answer_cache.set(answer_key, entry)
 
     # 8. 推引用来源 + 结束帧（前端惯例：回答显示完再展开引用面板）
     yield _sse({"type": "meta", "prompt_version": prompts.CURRENT_PROMPT_VERSION})

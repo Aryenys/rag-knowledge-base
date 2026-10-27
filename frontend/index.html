@@ -139,6 +139,18 @@
     border: 1px solid #d5cbe9; border-radius: 10px;
     font-family: ui-monospace, Consolas, monospace;
   }
+  /* 【结构化输出】置信度 / 引用 / 拒答 徽标 */
+  .struct-badge {
+    display: inline-block; margin-bottom: 6px; margin-left: 6px; padding: 2px 8px;
+    font-size: 12px; border-radius: 10px;
+  }
+  .struct-high   { color: #0a7d3c; background: #e8f8ef; border: 1px solid #b7e4c7; }
+  .struct-medium { color: #8a6100; background: #fdf6e3; border: 1px solid #ecd9a0; }
+  .struct-low    { color: #a33; background: #fdeeee; border: 1px solid #f0c2c2; }
+  .struct-cited  { color: #3a5b9e; background: #eef3ff; border: 1px solid #c7d6f5; }
+  .struct-warn   { color: #a33; background: #fff8f8; border: 1px solid #f0c2c2; }
+  /* 引用来源里被模型实际点名的那几条，加个标记区分"检索到了"和"真的用了" */
+  .source-cited { color: #0a7d3c; font-size: 12px; margin-left: 6px; }
 </style>
 </head>
 <body>
@@ -173,6 +185,7 @@
       </div>
       <label id="agent-toggle">
         <input type="checkbox" id="agent-mode"> Agent 模式（模型自主决定是否检索 / 查询知识库统计）
+        <input type="checkbox" id="structured-mode"> 结构化输出（按 JSON schema 返回，非流式）
       </label>
     </div>
   </div>
@@ -183,6 +196,7 @@ const chatEl = document.getElementById("chat");
 const questionEl = document.getElementById("question");
 const sendBtn = document.getElementById("send-btn");
 const agentModeEl = document.getElementById("agent-mode");
+const structuredModeEl = document.getElementById("structured-mode");
 const sessionListEl = document.getElementById("session-list");
 
 // 当前会话 id。null = 还没开始对话，后端收到 null 会自动新建一个会话
@@ -284,6 +298,9 @@ async function send() {
   const botEl = addMsg("bot", "");
   botEl.classList.add("typing");   // 打字光标
 
+  // 结构化模式下模型点名用到的资料编号集合，渲染引用面板时用来标记"真的被引用了"
+  let citedSet = null;
+
   // Agent 模式下的"工具调用过程"面板，插在回答气泡上方。
   // 先建好但隐藏，收到 tool 帧再显示并填内容。
   const traceEl = document.createElement("div");
@@ -302,6 +319,9 @@ async function send() {
         session_id: currentSessionId,
         // Agent 开关：勾选后由模型自行决定是否检索；不勾选走原链路
         agent: agentModeEl.checked,
+        // 结构化开关：勾选后模型按 schema 返回 JSON（不再逐字流式）
+        // ⚠️ 与 agent 同时勾选时后端以 agent 优先
+        structured: structuredModeEl.checked,
       }),
     });
 
@@ -327,6 +347,35 @@ async function send() {
           currentSessionId = data.id;
         } else if (data.type === "token") {
           botEl.textContent += data.content;          // 逐 token 追加 = 打字机
+          chatEl.scrollTop = chatEl.scrollHeight;
+        } else if (data.type === "structured") {
+          // 【结构化输出】一次性拿到完整回答 + 可机读字段（非流式，JSON 必须完整才合法）
+          const p = data.content || {};
+          botEl.textContent = p.answer || "";
+          citedSet = new Set(p.citations || []);
+
+          const addBadge = (cls, text) => {
+            const b = document.createElement("div");
+            b.className = "struct-badge " + cls;
+            b.textContent = text;                      // 用 textContent，模型返回的内容不当 HTML 解析
+            botEl.parentNode.insertBefore(b, botEl);
+          };
+
+          const confText = { high: "高", medium: "中", low: "低" }[p.confidence] || "中";
+          addBadge("struct-" + (p.confidence || "medium"), "把握度：" + confText);
+
+          if (p.citations && p.citations.length) {
+            addBadge("struct-cited", "引用 " + p.citations.map(i => "[" + i + "]").join(""));
+          } else {
+            addBadge("struct-cited", "未引用资料");
+          }
+          if (p.answered === false) {
+            addBadge("struct-warn", "⚠ 拒答：" + (p.refuse_reason || "资料不足"));
+          }
+          if (p.parse_ok === false) {
+            // 解析失败已经降级成纯文本，如实告诉用户，别装作结构化成功
+            addBadge("struct-warn", "⚠ 结构化解析失败，已降级为纯文本");
+          }
           chatEl.scrollTop = chatEl.scrollHeight;
         } else if (data.type === "tool") {
           // 【Agent】模型决定调用某个工具：展示"调用了什么、传了什么参数"
@@ -364,7 +413,7 @@ async function send() {
             botEl.parentNode.insertBefore(badge, botEl);
           }
         } else if (data.type === "sources") {
-          renderSources(botEl, data.content);
+          renderSources(botEl, data.content, citedSet);
         } else if (data.type === "done") {
           // 刷新会话列表：此刻后端已把标题更新成问题的前 20 字
           loadSessions();
@@ -390,7 +439,9 @@ function escapeHtml(value) {
   });
 }
 
-function renderSources(botEl, sources) {
+// citedSet：结构化模式下模型点名用到的编号集合。
+// 区分"检索到了但没用"和"真的被引用"——这正是结构化输出才拿得到的信息。
+function renderSources(botEl, sources, citedSet) {
   if (!sources || sources.length === 0) return;
   const box = document.createElement("div");
   box.className = "sources";
@@ -402,6 +453,13 @@ function renderSources(botEl, sources) {
     // s.filename / s.content 来自用户上传的文档，属于不可信内容，必须先转义再拼接
     item.innerHTML = "<b>[" + escapeHtml(s.index) + "]</b> " + escapeHtml(s.filename) + pageText +
                      "（相关分 " + escapeHtml(s.score) + "）<br>" + escapeHtml(s.content.slice(0, 80)) + "...";
+    // 历史消息没有 citedSet（当时没走结构化），此时不显示标记
+    if (citedSet && citedSet.has(s.index)) {
+      const tag = document.createElement("span");
+      tag.className = "source-cited";
+      tag.textContent = "✓ 回答中已引用";
+      item.appendChild(tag);
+    }
     box.appendChild(item);
   }
   botEl.appendChild(box);

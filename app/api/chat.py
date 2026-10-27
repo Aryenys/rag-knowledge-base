@@ -19,16 +19,20 @@ async def chat_stream(req: ChatRequest):
     数据帧格式约定（前端按此解析）：
       - data: {"type": "session", "id": 1}              会话 id（首帧）
       - data: {"type": "token",   "content": "..."}   逐 token 推送
+      - data: {"type": "structured", "content": {...}} 【结构化模式】一次性推送完整结构化回答
       - data: {"type": "tool",    "name": "...", "arguments": {...}, "round": 1}   【Agent】工具调用
       - data: {"type": "tool_result", "name": "...", "summary": "...", "round": 1} 【Agent】工具结果摘要
       - data: {"type": "sources", "content": [...]}   生成完毕后推送引用来源
       - data: {"type": "done"}                          结束帧
     """
     # agent=true 走 Agent 决策层；默认仍走原链路，保证老前端与老调用方行为不变
+    # structured=true 走结构化输出（非流式一次性返回）。
+    # ⚠️ 两个开关同时为 true 时以 agent 优先：Agent 用的是工具调用协议，
+    #    本身就是结构化的，再套一层 JSON schema 只会限制它调工具。
     stream = (
         agent_service.stream_agent_answer(req.question, req.session_id)
         if req.agent
-        else chat_service.stream_answer(req.question, req.session_id)
+        else chat_service.stream_answer(req.question, req.session_id, structured=req.structured)
     )
     return StreamingResponse(
         stream,
